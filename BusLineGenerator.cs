@@ -1,6 +1,7 @@
-// AutoBusLines v2.0.7 - Modular transit planning and generation system
+// AutoBusLines v2.1.0 - Modular transit planning and generation system
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Colossal.Logging;
 using Colossal.Mathematics;
@@ -218,11 +219,55 @@ namespace AutoBusLines
         {
             Idle,
             WaitingForCleanup,
+            PlanningSetup,
+            PlanningStops,
+            PlanningHubs,
+            PlanningCorridors,
+            PlanningFinish,
             InstantiatingStops,
             WaitingForStopIndexing,
             InstantiatingRoutes,
             SettlingRoutes
         }
+
+        private class PlanningSessionState
+        {
+            public bool PlanOnly;
+            public int SeedOffset;
+            public bool AutoOpenPanel;
+            public Entity DistrictFilter;
+            public string DistrictName;
+            public Entity BusLinePrefabEntity;
+            public RouteData BusLineRouteData;
+            public List<Entity> CandidatePrefabs;
+            public Dictionary<Entity, int> StopPlacementCounts = new Dictionary<Entity, int>();
+            public Unity.Mathematics.Random Rng;
+            public List<float3> ExclusionPositions;
+            public Dictionary<Entity, List<PlacedStop>> ExistingStopsByRoad;
+            public List<RoadCorridor> AllCorridors;
+            public List<BlockSpan> BlockSpans;
+            public List<PlacedStop> AllGlobalStops = new List<PlacedStop>();
+            public List<CommittedStopInfo> CommittedStops = new List<CommittedStopInfo>();
+            public HashSet<Entity> BridgeNodes = new HashSet<Entity>();
+            public int CurrentSpanIndex = 0;
+            public int TotalDistrictSpans = 0;
+            public int TotalStopsPlaced = 0;
+            public int ExistingStopsReused = 0;
+            public int MinStopsPerLine;
+            public int MaxStopsPerLine;
+            public float MaxRouteLength;
+            public float TargetSpacing;
+            public float MinCollisionSpacing;
+            public float MinSpanLength;
+            public bool ExcludeDeadEnds;
+            public float DeadEndThreshold;
+            public HashSet<Entity> AlreadyCoveredStops;
+            public int ActiveBusLinesInCity;
+            public int UnservedStopCount;
+            public PlanContext PlanCtx;
+        }
+
+        private PlanningSessionState _planningSession = null;
 
         private GenerationStage _generationStage = GenerationStage.Idle;
         private int _waitFrameCounter = 0;
@@ -294,6 +339,8 @@ namespace AutoBusLines
             public bool IsOutbound;
             public float RoadT;
             public Entity PrefabEntity;
+            public bool HasRotationOverride;
+            public quaternion RotationOverride;
             public bool IsStationBay;
             public bool IsPreExisting;
         }
@@ -452,6 +499,7 @@ namespace AutoBusLines
 
         public void ResetOnSaveLoad()
         {
+            TargetDistrictId = 0;
             _hasRun = false;
             _isManualRequest = false;
             _isPlanRequest = false;
@@ -459,6 +507,7 @@ namespace AutoBusLines
             _isDiscardPlanRequest = false;
             _isRepairRequested = false;
             _generationStage = GenerationStage.Idle;
+            _planningSession = null;
             _waitFrameCounter = 0;
             _currentTourIndex = 0;
             _activePlan = null;
@@ -505,6 +554,7 @@ namespace AutoBusLines
         }
 
         private List<PlannedRoute> _activePlan = null;
+        private string _activePlanSelectedStopModel = null;
         private int _currentPlanSeed = 0;
         private bool _isPlanRequest = false;
         private int _requestedSeed = 0;
@@ -572,8 +622,38 @@ namespace AutoBusLines
                 {
                     _generationStage = GenerationStage.Idle;
                     _waitFrameCounter = 0;
-                    ExecuteGeneration(planOnly: false, seedOffset: 0, autoOpenPanel: false);
+                    StartStagedGeneration(planOnly: false, seedOffset: 0, autoOpenPanel: false);
                 }
+                return;
+            }
+
+            if (_generationStage == GenerationStage.PlanningSetup)
+            {
+                StepPlanningSetup();
+                return;
+            }
+
+            if (_generationStage == GenerationStage.PlanningStops)
+            {
+                StepPlanningStops();
+                return;
+            }
+
+            if (_generationStage == GenerationStage.PlanningHubs)
+            {
+                StepPlanningHubs();
+                return;
+            }
+
+            if (_generationStage == GenerationStage.PlanningCorridors)
+            {
+                StepPlanningCorridors();
+                return;
+            }
+
+            if (_generationStage == GenerationStage.PlanningFinish)
+            {
+                StepPlanningFinish();
                 return;
             }
 
@@ -591,7 +671,8 @@ namespace AutoBusLines
                     {
                         if (TryCreateBusStopEntity(st.RoadEntity, st.RoadT, st.Position, st.Forward, st.HubEntity,
                                                    st.CorridorIndex, st.SpanOrderInCorridor, st.IsOutbound,
-                                                   st.PrefabEntity, out PlacedStop realPlacedStop))
+                                                   st.PrefabEntity, out PlacedStop realPlacedStop,
+                                                   st.HasRotationOverride ? st.RotationOverride : (quaternion?)null))
                         {
                             _virtualToRealEntityMap[st.StopEntity.Index] = realPlacedStop.StopEntity;
                         }
@@ -940,12 +1021,21 @@ namespace AutoBusLines
             if (_isDiscardPlanRequest)
             {
                 _isDiscardPlanRequest = false;
+                _planningSession = null;
+                if (_generationStage == GenerationStage.PlanningSetup ||
+                    _generationStage == GenerationStage.PlanningStops ||
+                    _generationStage == GenerationStage.PlanningHubs ||
+                    _generationStage == GenerationStage.PlanningCorridors ||
+                    _generationStage == GenerationStage.PlanningFinish)
+                {
+                    _generationStage = GenerationStage.Idle;
+                }
                 _activePlan = null;
                 _currentPlanSeed = 0;
                 _plannedTours.Clear();
                 _plannedTourColors.Clear();
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "Plan discarded.");
                 AutoBusLinesUISystem.Instance?.UpdatePlan(null, 0, "Plan discarded.");
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "Plan discarded.");
                 return;
             }
 
@@ -966,7 +1056,7 @@ namespace AutoBusLines
             if (_isPlanRequest)
             {
                 _isPlanRequest = false;
-                ExecuteGeneration(planOnly: true, seedOffset: _requestedSeed, autoOpenPanel: true);
+                StartStagedGeneration(planOnly: true, seedOffset: _requestedSeed, autoOpenPanel: true);
                 return;
             }
 
@@ -980,14 +1070,36 @@ namespace AutoBusLines
             {
                 _hasRun = true;
                 _isManualRequest = false;
-                ExecuteGeneration(planOnly: true, seedOffset: 0, autoOpenPanel: false);
+                StartStagedGeneration(planOnly: true, seedOffset: 0, autoOpenPanel: false);
                 return;
             }
 
-            ExecuteGeneration(planOnly: false, seedOffset: 0, autoOpenPanel: false);
+            StartStagedGeneration(planOnly: false, seedOffset: 0, autoOpenPanel: false);
         }
-        private void ExecuteGeneration(bool planOnly, int seedOffset, bool autoOpenPanel)
+
+        private void StartStagedGeneration(bool planOnly, int seedOffset, bool autoOpenPanel)
         {
+            _planningSession = new PlanningSessionState
+            {
+                PlanOnly = planOnly,
+                SeedOffset = seedOffset,
+                AutoOpenPanel = autoOpenPanel
+            };
+            _generationStage = GenerationStage.PlanningSetup;
+            string phaseStatus = planOnly ? "planning" : "building";
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.08f, phaseStatus, "Analyzing road network and depot connections...");
+        }
+
+        private void StepPlanningSetup()
+        {
+            var state = _planningSession;
+            if (state == null)
+            {
+                _generationStage = GenerationStage.Idle;
+                return;
+            }
+
+            string phaseStatus = state.PlanOnly ? "planning" : "building";
             _districtBoundsCache.Clear();
             if (_depotFinder == null) _depotFinder = World.GetOrCreateSystemManaged<DepotFinderSystem>();
             if (_roadScanner == null) _roadScanner = World.GetOrCreateSystemManaged<RoadNetworkScanner>();
@@ -1004,79 +1116,81 @@ namespace AutoBusLines
             if (_depotFinder.AllHubs.Length == 0)
             {
                 log.Warn("ExecuteGeneration: No bus depots or stations found in city.");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
                 _hasRun = true;
                 _isManualRequest = false;
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "No Bus Depot or Bus Station found! Please build at least one Bus Depot or Bus Station first.");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "No Bus Depot or Bus Station found! Please build at least one Bus Depot or Bus Station first.");
                 return;
             }
 
             if (_roadScanner.RoadSegments.Length == 0)
             {
                 log.Warn("ExecuteGeneration: No municipal paved roads found in city.");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
                 _hasRun = true;
                 _isManualRequest = false;
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "No municipal paved roads found in city.");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "No municipal paved roads found in city.");
                 return;
             }
 
             if (roadToHub.Count == 0)
             {
                 log.Warn("ExecuteGeneration: Could not map any roads to transit hubs.");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
                 _hasRun = true;
                 _isManualRequest = false;
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "Could not connect city roads to available transit depots.");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "Could not connect city roads to available transit depots.");
                 return;
             }
 
-            log.Info($"=== Starting AutoBusLines {(planOnly ? "Plan Mode Preview" : "Direct Generation")} (Variant #{seedOffset + 1}) ===");
+            log.Info($"=== Starting AutoBusLines {(state.PlanOnly ? "Plan Mode Preview" : "Direct Generation")} (Variant #{state.SeedOffset + 1}) ===");
 
-            if (!FindBusStopPrefabs(out List<Entity> candidatePrefabs, out Entity defaultPrefab))
+            if (!FindBusStopPrefabs(out List<Entity> candidatePrefabs, out _))
             {
                 log.Error("Could not find any valid Bus Stop Prefabs with ObjectData archetype!");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
                 _hasRun = true;
                 _isManualRequest = false;
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "Error: No bus stop prefabs found.");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "Error: No bus stop prefabs found.");
                 return;
             }
 
             if (!FindBusLinePrefab(out Entity busLinePrefabEntity, out RouteData busLineRouteData))
             {
                 log.Error("Could not find a valid Bus Line Prefab with RouteData archetypes!");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
                 _hasRun = true;
                 _isManualRequest = false;
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "Error: Bus line prefab not found.");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "Error: Bus line prefab not found.");
                 return;
             }
 
             log.Info($"Found {candidatePrefabs.Count} Bus Stop Candidate Prefabs and Bus Line Prefab {busLinePrefabEntity.Index}");
 
-            var rng = new Unity.Mathematics.Random(185392u + (uint)(seedOffset * 7919));
+            state.CandidatePrefabs = candidatePrefabs;
+            state.BusLinePrefabEntity = busLinePrefabEntity;
+            state.BusLineRouteData = busLineRouteData;
+            state.Rng = new Unity.Mathematics.Random(185392u + (uint)(state.SeedOffset * 7919));
 
-            // Build exclusion zones around Bus Stations, Depots, and existing Platform Stops
-            var exclusionPositions = new List<float3>();
+            state.ExclusionPositions = new List<float3>();
             for (int h = 0; h < _depotFinder.AllHubs.Length; h++)
-            {
-                exclusionPositions.Add(_depotFinder.AllHubs[h].Position);
-            }
+                state.ExclusionPositions.Add(_depotFinder.AllHubs[h].Position);
             for (int p = 0; p < _depotFinder.StationPlatformStops.Length; p++)
             {
                 var platformEntity = _depotFinder.StationPlatformStops[p];
                 if (EntityManager.HasComponent<Game.Objects.Transform>(platformEntity))
-                {
-                    exclusionPositions.Add(EntityManager.GetComponentData<Game.Objects.Transform>(platformEntity).m_Position);
-                }
+                    state.ExclusionPositions.Add(EntityManager.GetComponentData<Game.Objects.Transform>(platformEntity).m_Position);
             }
 
-            // -------------------------------------------------------------
-            // STEP 0: Discover and Index ALL Existing Bus Stops in the City
-            // -------------------------------------------------------------
             var allExistingStops = DiscoverExistingBusStops(out var existingStopsByRoad);
+            state.ExistingStopsByRoad = existingStopsByRoad;
             log.Info($"Discovered {allExistingStops.Count} pre-existing bus stops in the city across all neighborhoods");
 
-            // -------------------------------------------------------------
-            // STEP 1: Plan Transit Corridors
-            // Corridors are continuous street chains across the city.
-            // -------------------------------------------------------------
             int minStopsPerLine = Mod.setting != null ? Mod.setting.MinStopsPerLine : MIN_STOPS_PER_LINE;
             int maxStopsPerLine = Mod.setting != null ? Mod.setting.MaxStopsPerLine : MAX_STOPS_PER_LINE;
             float maxRouteLength = Mod.setting != null ? (float)Mod.setting.MaxRouteLength : DEFAULT_MAX_ROUTE_LENGTH;
@@ -1088,17 +1202,21 @@ namespace AutoBusLines
             if (targetSpacing < 50f) targetSpacing = 50f;
             if (targetSpacing > 600f) targetSpacing = 600f;
 
-            float servedRadius = targetSpacing * 0.85f;
-            float minCollisionSpacing = math.clamp(targetSpacing * 0.40f, 35f, 120f);
-            float minSpanLength = math.clamp(targetSpacing * 0.20f, 20f, 35f);
+            state.MinStopsPerLine = minStopsPerLine;
+            state.MaxStopsPerLine = maxStopsPerLine;
+            state.MaxRouteLength = maxRouteLength;
+            state.TargetSpacing = targetSpacing;
+            state.MinCollisionSpacing = math.clamp(targetSpacing * 0.40f, 35f, 120f);
+            state.MinSpanLength = math.clamp(targetSpacing * 0.20f, 20f, 35f);
+            state.ExcludeDeadEnds = Mod.setting != null ? Mod.setting.ExcludeDeadEnds : true;
+            state.DeadEndThreshold = Mod.setting != null ? (float)Mod.setting.DeadEndDistanceThreshold : 500f;
 
             var allCorridors = BuildCorridors();
             allCorridors.Sort((a, b) => b.TotalLength.CompareTo(a.TotalLength));
 
-            if (seedOffset > 0)
+            if (state.SeedOffset > 0)
             {
-                // Deterministic shuffle with seedOffset to produce alternative corridor pairings and route loops
-                var prng = new System.Random(seedOffset * 1013);
+                var prng = new System.Random(state.SeedOffset * 1013);
                 for (int i = allCorridors.Count - 1; i > 0; i--)
                 {
                     int j = prng.Next(i + 1);
@@ -1108,20 +1226,12 @@ namespace AutoBusLines
                 }
             }
 
-            // -------------------------------------------------------------
-            // STEP 2: Place Bus Stops Across ALL City Blocks & Neighborhoods
-            // Ensures full city coverage based on user's target density/spacing.
-            // On two-way streets, stops alternate curbs to provide two-way coverage.
-            // Multi-stop placement supports long arterial spans.
-            // -------------------------------------------------------------
-            var blockSpans = BuildBlockSpans(allCorridors);
-
-            var allGlobalStops = new List<PlacedStop>();
-            var committedStops = new List<CommittedStopInfo>();
+            state.AllCorridors = allCorridors;
+            state.BlockSpans = BuildBlockSpans(allCorridors);
 
             for (int e = 0; e < allExistingStops.Count; e++)
             {
-                committedStops.Add(new CommittedStopInfo
+                state.CommittedStops.Add(new CommittedStopInfo
                 {
                     Position = allExistingStops[e].Position,
                     Forward = allExistingStops[e].Forward,
@@ -1130,11 +1240,6 @@ namespace AutoBusLines
                 });
             }
 
-            int totalStopsPlaced = 0;
-            int existingStopsReused = 0;
-
-            // Precompute bridge nodes to identify long bridge approach connector spans
-            var bridgeNodes = new HashSet<Entity>();
             if (_roadScanner != null && _roadScanner.DrivableSegments.IsCreated)
             {
                 for (int i = 0; i < _roadScanner.DrivableSegments.Length; i++)
@@ -1143,272 +1248,229 @@ namespace AutoBusLines
                     if (IsElevatedOrBridge(e) && EntityManager.HasComponent<Edge>(e))
                     {
                         var edge = EntityManager.GetComponentData<Edge>(e);
-                        if (edge.m_Start != Entity.Null) bridgeNodes.Add(edge.m_Start);
-                        if (edge.m_End != Entity.Null) bridgeNodes.Add(edge.m_End);
+                        if (edge.m_Start != Entity.Null) state.BridgeNodes.Add(edge.m_Start);
+                        if (edge.m_End != Entity.Null) state.BridgeNodes.Add(edge.m_End);
                     }
                 }
             }
 
-            // Sort spans so major arterial corridors are processed first, then neighborhood side streets.
-            // Sorting by CorridorLength first ensures dominant avenues receive clean transit stops,
-            // while minor perpendicular side streets within servedRadius are properly served without cluttering "the sides".
-            blockSpans.Sort((a, b) =>
+            state.BlockSpans.Sort((a, b) =>
             {
                 int cmp = b.CorridorLength.CompareTo(a.CorridorLength);
                 if (cmp != 0) return cmp;
                 return b.TotalLength.CompareTo(a.TotalLength);
             });
 
-            bool excludeDeadEnds = Mod.setting != null ? Mod.setting.ExcludeDeadEnds : true;
-            float deadEndThreshold = Mod.setting != null ? (float)Mod.setting.DeadEndDistanceThreshold : 500f;
-
-            Entity districtFilter = FindDistrictEntity(TargetDistrictId);
-            string districtName = districtFilter != Entity.Null ? (_nameSystem?.GetRenderedLabelName(districtFilter) ?? $"District {districtFilter.Index}") : "All City";
-            if (districtFilter != Entity.Null)
+            state.DistrictFilter = FindDistrictEntity(TargetDistrictId);
+            state.DistrictName = state.DistrictFilter != Entity.Null
+                ? (_nameSystem?.GetRenderedLabelName(state.DistrictFilter) ?? $"District {state.DistrictFilter.Index}")
+                : "All City";
+            if (state.DistrictFilter != Entity.Null)
             {
-                log.Info($"[ExecuteGeneration] Scoping transit network generation to District: '{districtName}' (Entity {districtFilter.Index})");
+                log.Info($"[ExecuteGeneration] Scoping transit network generation to District: '{state.DistrictName}' (Entity {state.DistrictFilter.Index})");
             }
 
-            int totalDistrictSpans = 0;
-            for (int s = 0; s < blockSpans.Count; s++)
+            state.CurrentSpanIndex = 0;
+            _generationStage = GenerationStage.PlanningStops;
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.25f, phaseStatus, $"Calculating transit corridors & stop locations (0 / {state.BlockSpans.Count} spans)...");
+        }
+
+        private void StepPlanningStops()
+        {
+            var state = _planningSession;
+            if (state == null)
             {
-                var span = blockSpans[s];
-                if (span.TotalLength < minSpanLength)
-                    continue;
-
-                // Skip spans outside the target district if filtered
-                if (districtFilter != Entity.Null)
-                {
-                    if (!IsSpanInDistrict(span, districtFilter))
-                        continue;
-                    totalDistrictSpans++;
-                }
-
-                // Skip cul-de-sacs and dead-end roads unless they exceed the user's distance threshold
-                if (excludeDeadEnds && span.IsDeadEnd)
-                {
-                    float effectiveLength = math.max(span.DeadEndBranchLength, span.TotalLength);
-                    if (effectiveLength < deadEndThreshold)
-                    {
-                        log.Info($"[ExcludeDeadEnds] Skipping stop on short dead-end span #{span.SpanId}: branch={effectiveLength:F1}m (span={span.TotalLength:F1}m) (< threshold {deadEndThreshold:F0}m)");
-                        continue;
-                    }
-                    else
-                    {
-                        log.Info($"[ExcludeDeadEnds] Allowing stop on long dead-end span #{span.SpanId}: branch={effectiveLength:F1}m (span={span.TotalLength:F1}m) (>= threshold {deadEndThreshold:F0}m)");
-                    }
-                }
-
-                // Long connector spans connecting directly to an elevated bridge deck:
-                // Use wider spacing (450m) so long approach links don't spam 6+ stops in empty terrain,
-                // while still maintaining stepping-stone connectivity for bus lines across the river.
-                bool touchesBridge = (span.StartNode != Entity.Null && bridgeNodes.Contains(span.StartNode)) ||
-                                     (span.EndNode != Entity.Null && bridgeNodes.Contains(span.EndNode));
-                float effectiveSpacing = (touchesBridge && span.TotalLength >= 350f)
-                    ? math.max(targetSpacing * 2.2f, 450f)
-                    : targetSpacing;
-
-                // Check exclusion radius around hubs (stations & depots)
-                bool isNearHub = false;
-                for (int ep = 0; ep < exclusionPositions.Count; ep++)
-                {
-                    if (math.distance(span.MidPosition, exclusionPositions[ep]) < HUB_EXCLUSION_RADIUS)
-                    {
-                        isNearHub = true;
-                        break;
-                    }
-                }
-                if (isNearHub)
-                    continue;
-
-                // Reuse pre-existing stop if present on this span
-                if (TryFindExistingStopOnSpan(span, existingStopsByRoad, out PlacedStop reusedStop))
-                {
-                    reusedStop.CorridorIndex = span.CorridorIndex;
-                    reusedStop.SpanOrderInCorridor = span.SpanOrderInCorridor;
-                    reusedStop.IsOutbound = (math.dot(reusedStop.Forward, span.CorridorForwardTangent) >= 0f);
-                    allGlobalStops.Add(reusedStop);
-                    existingStopsReused++;
-                    committedStops.Add(new CommittedStopInfo
-                    {
-                        Position = reusedStop.Position,
-                        Forward = reusedStop.Forward,
-                        CorridorIndex = span.CorridorIndex,
-                        SpanId = span.SpanId
-                    });
-
-                    // For short to moderate spans, the reused stop covers this span
-                    if (span.TotalLength <= effectiveSpacing * 1.6f)
-                        continue;
-                }
-
-                // Determine how many stops this span should receive based on effectiveSpacing
-                int stopsToPlace = math.max(1, (int)math.round(span.TotalLength / effectiveSpacing));
-                if (touchesBridge && span.TotalLength >= 350f)
-                {
-                    stopsToPlace = math.min(stopsToPlace, 2); // Cap long bridge approaches at at most 2 stops
-                }
-
-                for (int i = 0; i < stopsToPlace; i++)
-                {
-                    Entity roadEdge;
-                    float edgeT;
-                    float3 roadPos;
-                    float3 roadTan;
-
-                    if (stopsToPlace == 1)
-                    {
-                        roadEdge = span.MidEdge;
-                        edgeT = span.MidT;
-                        roadPos = span.MidPosition;
-                        roadTan = span.MidTangent;
-
-                        // If span.MidEdge has a very short curve (< 14m) or is bridge, pick the longest edge in the span
-                        if (EntityManager.HasComponent<Curve>(roadEdge))
-                        {
-                            var midCurve = EntityManager.GetComponentData<Curve>(roadEdge);
-                            if (MathUtils.Length(midCurve.m_Bezier) < 14.0f && span.Edges.Count > 1)
-                            {
-                                float maxLen = 0f;
-                                for (int e = 0; e < span.Edges.Count; e++)
-                                {
-                                    var cand = span.Edges[e].EdgeEntity;
-                                    if (cand != Entity.Null && EntityManager.HasComponent<Curve>(cand) && !IsElevatedOrBridge(cand))
-                                    {
-                                        var candCurve = EntityManager.GetComponentData<Curve>(cand);
-                                        float candLen = MathUtils.Length(candCurve.m_Bezier);
-                                        if (candLen > maxLen)
-                                        {
-                                            maxLen = candLen;
-                                            roadEdge = cand;
-                                            edgeT = 0.5f;
-                                            roadPos = MathUtils.Position(candCurve.m_Bezier, 0.5f);
-                                            float3 cTan = MathUtils.Tangent(candCurve.m_Bezier, 0.5f);
-                                            if (span.Edges[e].IsReversed) cTan = -cTan;
-                                            roadTan = math.normalizesafe(cTan, new float3(0, 0, 1));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // If the span's midpoint edge happens to be a bridge or drawbridge, search for an alternative non-bridge edge in the span
-                        if (IsElevatedOrBridge(roadEdge))
-                        {
-                            bool foundAlternative = false;
-                            for (int e = 0; e < span.Edges.Count; e++)
-                            {
-                                var candEdge = span.Edges[e].EdgeEntity;
-                                if (!IsElevatedOrBridge(candEdge) && EntityManager.HasComponent<Curve>(candEdge))
-                                {
-                                    var candCurve = EntityManager.GetComponentData<Curve>(candEdge);
-                                    roadEdge = candEdge;
-                                    edgeT = 0.5f;
-                                    roadPos = MathUtils.Position(candCurve.m_Bezier, 0.5f);
-                                    float3 cTan = MathUtils.Tangent(candCurve.m_Bezier, 0.5f);
-                                    if (span.Edges[e].IsReversed) cTan = -cTan;
-                                    roadTan = math.normalizesafe(cTan, new float3(0, 0, 1));
-                                    foundAlternative = true;
-                                    break;
-                                }
-                            }
-                            if (!foundAlternative)
-                                continue; // Entire span consists of bridge edges; skip placing stops on bridge deck
-                        }
-                    }
-                    else
-                    {
-                        float targetDist = (i + 1.0f) / (stopsToPlace + 1.0f) * span.TotalLength;
-                        if (!TryGetSpanPointAtDistance(span, targetDist, out roadEdge, out edgeT, out roadPos, out roadTan))
-                            continue;
-
-                        if (IsElevatedOrBridge(roadEdge))
-                            continue;
-                    }
-
-                    // Check hub exclusion
-                    bool ptNearHub = false;
-                    for (int ep = 0; ep < exclusionPositions.Count; ep++)
-                    {
-                        if (math.distance(roadPos, exclusionPositions[ep]) < HUB_EXCLUSION_RADIUS)
-                        {
-                            ptNearHub = true;
-                            break;
-                        }
-                    }
-                    if (ptNearHub)
-                        continue;
-
-                    // Check if this candidate location is already served by a committed stop
-                    // Stops on the same span are allowed if they exceed minCollisionSpacing;
-                    // Other spans are checked against servedRadius.
-                    bool isAlreadyServed = false;
-                    for (int k = 0; k < committedStops.Count; k++)
-                    {
-                        float checkDist = (committedStops[k].SpanId == span.SpanId) ? minCollisionSpacing : 25.0f;
-                        if (math.distance(roadPos, committedStops[k].Position) < checkDist)
-                        {
-                            isAlreadyServed = true;
-                            break;
-                        }
-                    }
-                    if (isAlreadyServed)
-                        continue;
-
-                    // Place alternating kerb stop
-                    int order = span.SpanOrderInCorridor + i;
-                    float3 forwardTan = (math.lengthsq(span.CorridorForwardTangent) > 0.001f) ? span.CorridorForwardTangent : roadTan;
-
-                    if (TryPlaceAlternatingKerbStop(span, roadEdge, edgeT, roadPos, forwardTan,
-                                                    order,
-                                                    committedStops, candidatePrefabs, ref rng,
-                                                    minCollisionSpacing, planOnly, allGlobalStops.Count, out PlacedStop placedStop))
-                    {
-                        allGlobalStops.Add(placedStop);
-                        totalStopsPlaced++;
-                    }
-                }
-            }
-
-            string scopeDesc = districtFilter != Entity.Null ? $"in District '{districtName}' ({totalDistrictSpans} matching spans)" : "across the city";
-            log.Info($"Step 2 Complete: {allGlobalStops.Count} total stops available {scopeDesc} ({totalStopsPlaced} newly placed, {existingStopsReused} existing reused) with target spacing {targetSpacing:F0}m.");
-
-            // -------------------------------------------------------------
-            // Coverage & Active Routes Verification
-            // Prevent generating duplicate lines if roads and stops already have active service.
-            // -------------------------------------------------------------
-            var alreadyCoveredStops = GetStopsCoveredByActiveBusLines(out int activeBusLinesInCity);
-            log.Info($"Coverage Check: Discovered {activeBusLinesInCity} active bus lines currently serving {alreadyCoveredStops.Count} stops in the city.");
-
-            int unservedStopCount = 0;
-            for (int i = 0; i < allGlobalStops.Count; i++)
-            {
-                if (!allGlobalStops[i].IsStationBay && !alreadyCoveredStops.Contains(allGlobalStops[i].StopEntity))
-                {
-                    unservedStopCount++;
-                }
-            }
-
-            if (activeBusLinesInCity > 0 && unservedStopCount == 0)
-            {
-                log.Info($"ExecuteGeneration: All {allGlobalStops.Count} stops are already covered by {activeBusLinesInCity} active bus lines. Skipping duplicate line generation.");
                 _generationStage = GenerationStage.Idle;
-                _hasRun = true;
-                _isManualRequest = false;
-                string statusMsg = (districtFilter != Entity.Null)
-                    ? $"All stops in '{districtName}' are already covered by active bus lines."
-                    : $"City transit network is already fully covered by {activeBusLinesInCity} active bus lines ({alreadyCoveredStops.Count} stops served). Use 'Delete All' if you wish to redesign from scratch.";
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", statusMsg);
                 return;
             }
 
-            // -------------------------------------------------------------
-            // STEP 3: Plan the bus loops (see BusLineGenerator.Planning.cs)
-            // Builds validated closed cycles of legal, connected road edges: one-way directions are
-            // respected, hairpin U-turns are only used at dead ends, and every loop stays within
-            // maxRouteLength.
-            // -------------------------------------------------------------
-            var allTours = PlanTours(allGlobalStops, allCorridors, minStopsPerLine, maxStopsPerLine, maxRouteLength, alreadyCoveredStops, districtFilter, out var servedStopEntities);
+            string phaseStatus = state.PlanOnly ? "planning" : "building";
+            var sw = Stopwatch.StartNew();
+
+            while (state.CurrentSpanIndex < state.BlockSpans.Count)
+            {
+                var span = state.BlockSpans[state.CurrentSpanIndex];
+                state.CurrentSpanIndex++;
+
+                if (span.TotalLength >= state.MinSpanLength)
+                {
+                    if (state.DistrictFilter != Entity.Null)
+                    {
+                        if (!IsSpanInDistrict(span, state.DistrictFilter))
+                            goto CheckFrameBudget;
+                        state.TotalDistrictSpans++;
+                    }
+
+                    if (state.ExcludeDeadEnds && span.IsDeadEnd)
+                    {
+                        float effectiveLength = math.max(span.DeadEndBranchLength, span.TotalLength);
+                        if (effectiveLength < state.DeadEndThreshold)
+                        {
+                            log.Info($"[ExcludeDeadEnds] Skipping stop on short dead-end span #{span.SpanId}: branch={effectiveLength:F1}m (span={span.TotalLength:F1}m) (< threshold {state.DeadEndThreshold:F0}m)");
+                            goto CheckFrameBudget;
+                        }
+                        else
+                        {
+                            log.Info($"[ExcludeDeadEnds] Allowing stop on long dead-end span #{span.SpanId}: branch={effectiveLength:F1}m (span={span.TotalLength:F1}m) (>= threshold {state.DeadEndThreshold:F0}m)");
+                        }
+                    }
+
+                    bool touchesBridge = (span.StartNode != Entity.Null && state.BridgeNodes.Contains(span.StartNode)) ||
+                                         (span.EndNode != Entity.Null && state.BridgeNodes.Contains(span.EndNode));
+                    float effectiveSpacing = (touchesBridge && span.TotalLength >= 350f)
+                        ? math.max(state.TargetSpacing * 2.2f, 450f)
+                        : state.TargetSpacing;
+
+                    bool isNearHub = false;
+                    for (int ep = 0; ep < state.ExclusionPositions.Count; ep++)
+                    {
+                        if (math.distance(span.MidPosition, state.ExclusionPositions[ep]) < HUB_EXCLUSION_RADIUS)
+                        {
+                            isNearHub = true;
+                            break;
+                        }
+                    }
+                    if (isNearHub)
+                        goto CheckFrameBudget;
+
+                    PlaceStopsForSpan(
+                        span,
+                        effectiveSpacing,
+                        touchesBridge,
+                        state.MinCollisionSpacing,
+                        state.PlanOnly,
+                        state.ExclusionPositions,
+                        state.ExistingStopsByRoad,
+                        state.CommittedStops,
+                        state.CandidatePrefabs,
+                        state.StopPlacementCounts,
+                        ref state.Rng,
+                        ref state.TotalStopsPlaced,
+                        ref state.ExistingStopsReused,
+                        state.AllGlobalStops);
+                }
+
+            CheckFrameBudget:
+                if (state.CurrentSpanIndex < state.BlockSpans.Count && (state.CurrentSpanIndex % 25 == 0) && sw.ElapsedMilliseconds >= 12)
+                {
+                    float frac = (float)state.CurrentSpanIndex / math.max(1, state.BlockSpans.Count);
+                    AutoBusLinesUISystem.Instance?.SetBuildProgress(
+                        0.25f + 0.30f * frac,
+                        phaseStatus,
+                        $"Evaluating road spans & placing bus stops ({state.CurrentSpanIndex} / {state.BlockSpans.Count})...");
+                    return;
+                }
+            }
+
+            string scopeDesc = state.DistrictFilter != Entity.Null ? $"in District '{state.DistrictName}' ({state.TotalDistrictSpans} matching spans)" : "across the city";
+            var newlyPlacedPrefabs = new List<Entity>();
+            for (int i = 0; i < state.AllGlobalStops.Count; i++)
+            {
+                if (!state.AllGlobalStops[i].IsPreExisting && !state.AllGlobalStops[i].IsStationBay)
+                    newlyPlacedPrefabs.Add(state.AllGlobalStops[i].PrefabEntity);
+            }
+            log.Info($"Step 2 Complete: {state.AllGlobalStops.Count} total stops available {scopeDesc} ({state.TotalStopsPlaced} newly placed, {state.ExistingStopsReused} existing reused) with target spacing {state.TargetSpacing:F0}m. Newly placed models: {FormatPlacedStopPrefabBreakdown(newlyPlacedPrefabs)}.");
+
+            state.AlreadyCoveredStops = GetStopsCoveredByActiveBusLines(out int activeBusLinesInCity);
+            state.ActiveBusLinesInCity = activeBusLinesInCity;
+            log.Info($"Coverage Check: Discovered {activeBusLinesInCity} active bus lines currently serving {state.AlreadyCoveredStops.Count} stops in the city.");
+
+            int unservedStopCount = 0;
+            for (int i = 0; i < state.AllGlobalStops.Count; i++)
+            {
+                if (!state.AllGlobalStops[i].IsStationBay && !state.AlreadyCoveredStops.Contains(state.AllGlobalStops[i].StopEntity))
+                    unservedStopCount++;
+            }
+            state.UnservedStopCount = unservedStopCount;
+
+            if (activeBusLinesInCity > 0 && unservedStopCount == 0)
+            {
+                log.Info($"ExecuteGeneration: All {state.AllGlobalStops.Count} stops are already covered by {activeBusLinesInCity} active bus lines. Skipping duplicate line generation.");
+                _generationStage = GenerationStage.Idle;
+                _planningSession = null;
+                _hasRun = true;
+                _isManualRequest = false;
+                string statusMsg = (state.DistrictFilter != Entity.Null)
+                    ? $"All stops in '{state.DistrictName}' are already covered by active bus lines."
+                    : $"City transit network is already fully covered by {activeBusLinesInCity} active bus lines ({state.AlreadyCoveredStops.Count} stops served). Use 'Delete All' if you wish to redesign from scratch.";
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(1f, "idle", statusMsg);
+                return;
+            }
+
+            _generationStage = GenerationStage.PlanningHubs;
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.58f, phaseStatus, "Building transit graph & planning station hub loops...");
+        }
+
+        private void StepPlanningHubs()
+        {
+            var state = _planningSession;
+            if (state == null)
+            {
+                _generationStage = GenerationStage.Idle;
+                return;
+            }
+
+            state.PlanCtx = PreparePlanContextAndHubs(
+                state.AllGlobalStops, state.AllCorridors,
+                state.MinStopsPerLine, state.MaxStopsPerLine, state.MaxRouteLength,
+                state.AlreadyCoveredStops, state.DistrictFilter);
+
+            _generationStage = GenerationStage.PlanningCorridors;
+            string phaseStatus = state.PlanOnly ? "planning" : "building";
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.72f, phaseStatus, "Calculating arterial transit corridors...");
+        }
+
+        private void StepPlanningCorridors()
+        {
+            var state = _planningSession;
+            if (state == null || state.PlanCtx == null)
+            {
+                _generationStage = GenerationStage.Idle;
+                return;
+            }
+
+            PlanCorridorsPhase(state.PlanCtx);
+            _generationStage = GenerationStage.PlanningFinish;
+            string phaseStatus = state.PlanOnly ? "planning" : "building";
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.86f, phaseStatus, "Planning neighborhood feeder loops & validating paths...");
+        }
+
+        private void StepPlanningFinish()
+        {
+            var state = _planningSession;
+            if (state == null || state.PlanCtx == null)
+            {
+                _generationStage = GenerationStage.Idle;
+                return;
+            }
+
+            PlanLocalAndValidatePhase(state.PlanCtx);
+            var allTours = state.PlanCtx.Tours;
+            var servedStopEntities = state.PlanCtx.Served;
+            _planningSession = null;
+
+            FinalizePlannedTours(
+                state.PlanOnly, state.SeedOffset, state.AutoOpenPanel,
+                state.DistrictFilter, state.DistrictName,
+                state.AllGlobalStops, state.ActiveBusLinesInCity, state.UnservedStopCount,
+                state.BusLinePrefabEntity, state.BusLineRouteData,
+                allTours, servedStopEntities);
+        }
+
+        private void FinalizePlannedTours(
+            bool planOnly,
+            int seedOffset,
+            bool autoOpenPanel,
+            Entity districtFilter,
+            string districtName,
+            List<PlacedStop> allGlobalStops,
+            int activeBusLinesInCity,
+            int unservedStopCount,
+            Entity busLinePrefabEntity,
+            RouteData busLineRouteData,
+            List<List<PlacedStop>> allTours,
+            HashSet<Entity> servedStopEntities)
+        {
 
             // Ensure any station platform bays included in planned tours are present in allGlobalStops for accurate tracking
             for (int t = 0; t < allTours.Count; t++)
@@ -1549,12 +1611,14 @@ namespace AutoBusLines
                 }
 
                 _activePlan = plannedRoutes;
+                _activePlanSelectedStopModel = Mod.setting != null ? (Mod.setting.SelectedStopPrefab ?? "") : "";
                 _currentPlanSeed = seedOffset;
                 _generationStage = GenerationStage.Idle;
                 _hasRun = true;
                 _isManualRequest = false;
 
                 log.Info($"Plan Mode: Successfully generated {plannedRoutes.Count} proposed lines with {servedStopEntities.Count} stops (Variant #{seedOffset + 1}).");
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(1f);
                 AutoBusLinesUISystem.Instance?.UpdatePlan(plannedRoutes, seedOffset, $"Preview Plan Ready: {plannedRoutes.Count} lines proposed ({servedStopEntities.Count} stops).");
                 if (autoOpenPanel)
                 {

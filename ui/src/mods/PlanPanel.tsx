@@ -53,6 +53,7 @@ const stopDensityBinding = bindValue<string>("autoBusLines", "stopDensity", "Bal
 const targetSpacingBinding = bindValue<number>("autoBusLines", "targetStopSpacing", 200);
 const selectedPrefabBinding = bindValue<string>("autoBusLines", "selectedStopPrefab", "All");
 const prefabOptionsBinding = bindValue<string>("autoBusLines", "stopPrefabOptions", "[]");
+const modVersionBinding = bindValue<string>("autoBusLines", "modVersion", "2.1.0");
 
 // District & Stops-only bindings
 const districtsListBinding = bindValue<string>("autoBusLines", "districtsList", "[]");
@@ -294,6 +295,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
     const targetSpacing = useValue(targetSpacingBinding);
     const selectedPrefab = useValue(selectedPrefabBinding);
     const prefabOptionsJson = useValue(prefabOptionsBinding);
+    const modVersion = useValue(modVersionBinding);
 
     // District & Stops-only values
     const districtsListJson = useValue(districtsListBinding);
@@ -1124,7 +1126,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                 </div>
 
                 <div style={{ textAlign: "center", padding: "10rem 0 4rem 0", color: "#718096", fontSize: "11rem", fontWeight: 500 }}>
-                    Auto Bus Lines v2.0.7 · Cities: Skylines II
+                    {`Auto Bus Lines v${modVersion} · Cities: Skylines II`}
                 </div>
             </div>
         </Scrollable>
@@ -1146,22 +1148,6 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                     ? (statusMessage || "Staging bus stops and bus lines across frames...")
                     : "Select a district scope and click below to scan roads and preview proposed bus lines before building."}
             </div>
-            {planStatus === "building" && (
-                <div style={{ width: "100%", maxWidth: "420rem", marginTop: "12rem" }}>
-                    <div className={styles.progressBanner}>
-                        <div className={styles.progressHeader}>
-                            <span className={styles.progressStatusText}>{statusMessage || "Building..."}</span>
-                            <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
-                        </div>
-                        <div className={styles.progressBar}>
-                            <div
-                                className={styles.progressBarFill}
-                                style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
-                            />
-                        </div>
-                    </div>
-                </div>
-            )}
             {planStatus !== "planning" && planStatus !== "building" && (
                 <>
                     <div style={{ width: "100%", maxWidth: "420rem", marginBottom: "8rem" }}>
@@ -1199,17 +1185,23 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                     </Button>
                 </>
             )}
-            {planStatus === "building" ? (
-                <div className={styles.progressBanner}>
-                    <div className={styles.progressHeader}>
-                        <span className={styles.progressStatusText}>{statusMessage || "Building transit network..."}</span>
-                        <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
-                    </div>
-                    <div className={styles.progressBar}>
-                        <div
-                            className={styles.progressBarFill}
-                            style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
-                        />
+            {(planStatus === "planning" || planStatus === "building") ? (
+                <div style={{ width: "100%", maxWidth: "420rem", marginTop: "10rem" }}>
+                    <div className={styles.progressBanner}>
+                        <div className={styles.progressHeader}>
+                            <span className={styles.progressStatusText}>
+                                {statusMessage || (planStatus === "planning"
+                                    ? "Analyzing road network and calculating transit corridors..."
+                                    : "Building transit network...")}
+                            </span>
+                            <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
+                        </div>
+                        <div className={styles.progressBar}>
+                            <div
+                                className={styles.progressBarFill}
+                                style={{ width: `${Math.max(4, Math.min(100, Math.round(buildProgress * 100)))}%` }}
+                            />
+                        </div>
                     </div>
                 </div>
             ) : statusMessage ? (
@@ -1260,7 +1252,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                         variant="flat"
                         className={styles.actionBtn}
                         onSelect={() => setActiveTab("settings")}
-                        disabled={planStatus === "building"}
+                        disabled={planStatus === "planning" || planStatus === "building"}
                     >
                         <Icon src="Media/Glyphs/Gear.svg" className={styles.actionBtnIcon} tinted={true} />
                         <span>Settings</span>
@@ -1272,7 +1264,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                         variant="flat"
                         className={styles.actionBtn}
                         onSelect={handleDiscard}
-                        disabled={planStatus === "building"}
+                        disabled={planStatus === "planning" || planStatus === "building"}
                     >
                         Discard
                     </Button>
@@ -1283,23 +1275,27 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                         variant="primary"
                         className={styles.buildBtn}
                         onSelect={handleBuildSelected}
-                        disabled={enabledRouteCount === 0 || planStatus === "building"}
+                        disabled={enabledRouteCount === 0 || planStatus === "planning" || planStatus === "building"}
                     >
-                        {planStatus === "building" ? "Building..." : `Build Selected (${enabledRouteCount})`}
+                        {planStatus === "building" ? "Building..." : planStatus === "planning" ? "Planning..." : `Build Selected (${enabledRouteCount})`}
                     </Button>
                 </Tooltip>
             </div>
 
-            {planStatus === "building" ? (
+            {(planStatus === "planning" || planStatus === "building") ? (
                 <div className={styles.progressBanner}>
                     <div className={styles.progressHeader}>
-                        <span className={styles.progressStatusText}>{statusMessage || "Building transit network..."}</span>
+                        <span className={styles.progressStatusText}>
+                            {statusMessage || (planStatus === "planning"
+                                ? "Analyzing road network and calculating transit corridors..."
+                                : "Building transit network...")}
+                        </span>
                         <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
                     </div>
                     <div className={styles.progressBar}>
                         <div
                             className={styles.progressBarFill}
-                            style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
+                            style={{ width: `${Math.max(4, Math.min(100, Math.round(buildProgress * 100)))}%` }}
                         />
                     </div>
                 </div>

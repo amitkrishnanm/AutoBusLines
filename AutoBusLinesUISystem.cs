@@ -43,6 +43,7 @@ namespace AutoBusLines
         private ValueBinding<int> m_TargetStopSpacing;
         private ValueBinding<string> m_SelectedStopPrefab;
         private ValueBinding<string> m_StopPrefabOptions; // JSON array of names
+        private ValueBinding<string> m_ModVersion;
 
         public static AutoBusLinesUISystem Instance { get; private set; }
 
@@ -71,6 +72,7 @@ namespace AutoBusLines
             AddBinding(m_TargetStopSpacing = new ValueBinding<int>(kGroup, "targetStopSpacing", s?.TargetStopSpacing ?? 200));
             AddBinding(m_SelectedStopPrefab = new ValueBinding<string>(kGroup, "selectedStopPrefab", s?.SelectedStopPrefab ?? "All"));
             AddBinding(m_StopPrefabOptions = new ValueBinding<string>(kGroup, "stopPrefabOptions", "[]"));
+            AddBinding(m_ModVersion = new ValueBinding<string>(kGroup, "modVersion", s?.ModVersion ?? "2.1.0"));
 
             AddBinding(new TriggerBinding(kGroup, "togglePanel", OnTogglePanel));
             AddBinding(new TriggerBinding(kGroup, "openPanel", OnOpenPanel));
@@ -135,6 +137,7 @@ namespace AutoBusLines
             m_PlanJson.Update("[]");
             m_StatusMessage.Update("");
             m_PlanSeed.Update(0);
+            m_BuildProgress?.Update(0f);
             m_PanelVisible.Update(false);
             m_StopsOnlyStatus.Update("");
             m_SelectedDistrict.Update(0);
@@ -143,9 +146,18 @@ namespace AutoBusLines
             PlanRouteOverlaySystem.ClearCache();
 
             var generator = World.GetExistingSystemManaged<BusLineGenerator>();
-            generator?.UpdateDiscoveredPrefabs();
+            if (generator != null)
+            {
+                generator.TargetDistrictId = 0;
+                generator.UpdateDiscoveredPrefabs();
+            }
             UpdateStopPrefabOptions();
             UpdateDistrictsList();
+        }
+
+        public void SyncStopPrefabSelection(string prefabName)
+        {
+            m_SelectedStopPrefab?.Update(string.IsNullOrEmpty(prefabName) ? "All" : prefabName);
         }
 
         public static int HoveredRouteId { get; set; } = 0;
@@ -270,7 +282,7 @@ namespace AutoBusLines
             if (generator != null)
             {
                 generator.TargetDistrictId = m_SelectedDistrict.value;
-                SetPlanStatus("planning", "Analyzing road network and calculating transit corridors...");
+                SetBuildProgress(0.05f, "planning", "Analyzing road network and calculating transit corridors...");
                 m_PlanSeed.Update(0);
                 generator.RequestPlan(0);
             }
@@ -287,7 +299,7 @@ namespace AutoBusLines
                 generator.TargetDistrictId = m_SelectedDistrict.value;
                 int nextSeed = m_PlanSeed.value + 1;
                 m_PlanSeed.Update(nextSeed);
-                SetPlanStatus("planning", $"Calculating alternative transit network (Variant #{nextSeed + 1})...");
+                SetBuildProgress(0.05f, "planning", $"Calculating alternative transit network (Variant #{nextSeed + 1})...");
                 generator.RequestPlan(nextSeed);
             }
         }

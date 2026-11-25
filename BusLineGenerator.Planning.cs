@@ -475,6 +475,25 @@ namespace AutoBusLines
             Entity districtFilter,
             out HashSet<Entity> servedStopEntities)
         {
+            var ctx = PreparePlanContextAndHubs(
+                allGlobalStops, allCorridors, minStopsPerLine, maxStopsPerLine, maxRouteLength,
+                alreadyCoveredStops, districtFilter);
+            PlanCorridorsPhase(ctx);
+            PlanLocalAndValidatePhase(ctx);
+
+            servedStopEntities = ctx.Served;
+            return ctx.Tours;
+        }
+
+        private PlanContext PreparePlanContextAndHubs(
+            List<PlacedStop> allGlobalStops,
+            List<RoadCorridor> allCorridors,
+            int minStopsPerLine,
+            int maxStopsPerLine,
+            float maxRouteLength,
+            HashSet<Entity> alreadyCoveredStops,
+            Entity districtFilter)
+        {
             List<RoadCorridor> corridors = allCorridors;
             if (districtFilter != Entity.Null)
             {
@@ -526,10 +545,18 @@ namespace AutoBusLines
             BuildDirectedRoadGraph(out ctx.NodeOutEdges, out ctx.NodePositions);
             IndexStopsByDirectedEdge(allGlobalStops, out ctx.EdgeForwardStops, out ctx.EdgeBackwardStops);
             PrecomputeStopInfo(ctx);
-
             PlanStationHubLoops(ctx);
+            return ctx;
+        }
+
+        private void PlanCorridorsPhase(PlanContext ctx)
+        {
             PlanTrunkCouplets(ctx);
             PlanSingleCorridorLoops(ctx);
+        }
+
+        private void PlanLocalAndValidatePhase(PlanContext ctx)
+        {
             PlanFeederLoops(ctx);
             PlanDirectInsertions(ctx);
             PlanLastMileInsertions(ctx);
@@ -539,10 +566,10 @@ namespace AutoBusLines
 
             // Fallback: create cluster tours for unserved stops so that isolated areas across bridges are never left out
             var remainingUnserved = new List<PlacedStop>();
-            for (int i = 0; i < allGlobalStops.Count; i++)
+            for (int i = 0; i < ctx.Stops.Count; i++)
             {
-                if (!allGlobalStops[i].IsStationBay && !ctx.Served.Contains(allGlobalStops[i].StopEntity))
-                    remainingUnserved.Add(allGlobalStops[i]);
+                if (!ctx.Stops[i].IsStationBay && !ctx.Served.Contains(ctx.Stops[i].StopEntity))
+                    remainingUnserved.Add(ctx.Stops[i]);
             }
 
             if (remainingUnserved.Count >= ABSOLUTE_MIN_STOPS)
@@ -553,8 +580,8 @@ namespace AutoBusLines
                     var clusterStops = fallbackClusters[c];
                     if (clusterStops.Count >= ABSOLUTE_MIN_STOPS)
                     {
-                        if (clusterStops.Count > maxStopsPerLine)
-                            clusterStops = SubsampleTour(clusterStops, maxStopsPerLine);
+                        if (clusterStops.Count > ctx.MaxStops)
+                            clusterStops = SubsampleTour(clusterStops, ctx.MaxStops);
                         clusterStops = OrderStopsCircular(clusterStops);
                         ctx.Tours.Add(clusterStops);
                         for (int t = 0; t < clusterStops.Count; t++)
@@ -566,9 +593,6 @@ namespace AutoBusLines
 
             ValidateAndPruneTours(ctx);
             DiagnoseTours(ctx);
-
-            servedStopEntities = ctx.Served;
-            return ctx.Tours;
         }
 
         private void PrecomputeStopInfo(PlanContext ctx)

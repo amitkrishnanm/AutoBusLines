@@ -1206,6 +1206,19 @@ namespace AutoBusLines
             var virtualStopSet = new HashSet<int>();
             _virtualToRealEntityMap = new Dictionary<int, Entity>();
 
+            // Re-validate virtual stops against the user's current Bus Stop Model selection in case settings changed after plan preview
+            FindBusStopPrefabs(out var candidatePrefabs, out _);
+            var candidateSet = new HashSet<Entity>(candidatePrefabs);
+            string selectedModelSetting = Mod.setting != null ? (Mod.setting.SelectedStopPrefab ?? "") : "";
+            bool modelSelectionChanged = !string.Equals(_activePlanSelectedStopModel ?? "", selectedModelSetting, StringComparison.OrdinalIgnoreCase);
+            bool isCurbsideOnly = (!string.IsNullOrEmpty(selectedModelSetting) && selectedModelSetting.Equals("Curbside", StringComparison.OrdinalIgnoreCase))
+                || (candidatePrefabs.Count > 0 && candidatePrefabs.TrueForAll(IsBusStopSign));
+            var cityConfig = World.GetExistingSystemManaged<Game.City.CityConfigurationSystem>();
+            bool isLeftHandTraffic = cityConfig != null && cityConfig.leftHandTraffic;
+            var planRng = new Unity.Mathematics.Random((uint)Math.Max(1, _currentPlanSeed * 7919 + 185392));
+            var placedPrefabEntities = new List<Entity>();
+            var planPlacementCounts = new Dictionary<Entity, int>();
+
             for (int r = 0; r < _activePlan.Count; r++)
             {
                 var route = _activePlan[r];
@@ -1223,27 +1236,42 @@ namespace AutoBusLines
                     {
                         if (st.RoadEntity != Entity.Null && EntityManager.Exists(st.RoadEntity) && !EntityManager.HasComponent<Deleted>(st.RoadEntity))
                         {
-                            if (st.PrefabEntity == Entity.Null || !EntityManager.Exists(st.PrefabEntity))
-                            {
-                                FindBusStopPrefabs(out var candidatePrefabs, out _);
-                                Entity signPrefab = Entity.Null;
-                                for (int p = 0; p < candidatePrefabs.Count; p++)
-                                {
-                                    if (IsBusStopSign(candidatePrefabs[p]))
-                                    {
-                                        signPrefab = candidatePrefabs[p];
-                                        break;
-                                    }
-                                }
-                                if (signPrefab == Entity.Null && candidatePrefabs.Count > 0)
-                                    signPrefab = candidatePrefabs[0];
+                            bool needsPrefabRefresh = candidatePrefabs.Count > 0 && !st.IsStationBay &&
+                                (modelSelectionChanged || st.PrefabEntity == Entity.Null || !EntityManager.Exists(st.PrefabEntity) || !candidateSet.Contains(st.PrefabEntity));
 
-                                st.PrefabEntity = signPrefab;
+                            if (needsPrefabRefresh)
+                            {
+                                float3 roadCenterPos = st.Position;
+                                if (EntityManager.HasComponent<Curve>(st.RoadEntity))
+                                {
+                                    roadCenterPos = MathUtils.Position(EntityManager.GetComponentData<Curve>(st.RoadEntity).m_Bezier, st.RoadT);
+                                }
+                                float3 curbNormal = isLeftHandTraffic
+                                    ? new float3(-st.Forward.z, 0f, st.Forward.x)
+                                    : new float3(st.Forward.z, 0f, -st.Forward.x);
+                                bool isReverseSide = (st.SpanOrderInCorridor % 2 != 0);
+                                bool isStopOnRightSide = isLeftHandTraffic ? isReverseSide : !isReverseSide;
+
+                                st.PrefabEntity = SelectStopPrefabAndCurbSnap(
+                                    st.RoadEntity, st.RoadT, roadCenterPos, curbNormal, st.Position, isStopOnRightSide,
+                                    candidatePrefabs, isCurbsideOnly, ref planRng,
+                                    out float3 updatedPos, out quaternion? updatedRot, out float updatedT, planPlacementCounts);
+                                st.Position = updatedPos;
+                                st.RoadT = updatedT;
+                                st.HasRotationOverride = updatedRot.HasValue;
+                                st.RotationOverride = updatedRot ?? quaternion.identity;
+                                stopData.InternalStop = st;
+                            }
+                            else if (!st.IsStationBay && st.PrefabEntity != Entity.Null)
+                            {
+                                planPlacementCounts.TryGetValue(st.PrefabEntity, out int existingCount);
+                                planPlacementCounts[st.PrefabEntity] = existingCount + 1;
                             }
 
                             if (st.PrefabEntity != Entity.Null)
                             {
                                 uniqueVirtualStops.Add(st);
+                                placedPrefabEntities.Add(st.PrefabEntity);
                             }
                             else
                             {
@@ -1268,7 +1296,7 @@ namespace AutoBusLines
             {
                 _generationStage = GenerationStage.InstantiatingStops;
                 AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "building", $"Creating bus stop 0 / {_totalVirtualStopsToCreate} (0%)...");
-                log.Info($"Building Selected Plan: Beginning staged instantiation of {_totalVirtualStopsToCreate} bus stops across frames...");
+                log.Info($"Building Selected Plan: Beginning staged instantiation of {_totalVirtualStopsToCreate} bus stops across frames (Models: {FormatPlacedStopPrefabBreakdown(placedPrefabEntities)})...");
             }
             else
             {

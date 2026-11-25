@@ -69,10 +69,17 @@ namespace AutoBusLines
 
             int gravelExcludedCount = 0;
             int highwayExcludedCount = 0;
+            int nonDrivableExcludedCount = 0;
 
             for (int i = 0; i < entities.Length; i++)
             {
                 var roadEntity = entities[i];
+                if (!HasDrivableCarLane(roadEntity))
+                {
+                    nonDrivableExcludedCount++;
+                    continue;
+                }
+
                 if (IsGravelRoad(roadEntity))
                 {
                     gravelExcludedCount++;
@@ -94,7 +101,7 @@ namespace AutoBusLines
             {
                 if (_lastLoggedRoadCount != RoadSegments.Length)
                 {
-                    log.Info($"Scanned {entities.Length} total roads -> Added {RoadSegments.Length} municipal paved roads (Excluded {gravelExcludedCount} gravel/unpaved, {highwayExcludedCount} highways/ramps)");
+                    log.Info($"Scanned {entities.Length} total roads -> Added {RoadSegments.Length} municipal paved roads (Excluded {gravelExcludedCount} gravel/unpaved, {highwayExcludedCount} highways/ramps, {nonDrivableExcludedCount} non-car/pedestrian segments)");
                     _lastLoggedRoadCount = RoadSegments.Length;
                 }
                 _hasRun = true;
@@ -116,70 +123,95 @@ namespace AutoBusLines
         private readonly System.Collections.Generic.Dictionary<Entity, bool> _highwayPrefabCache = new System.Collections.Generic.Dictionary<Entity, bool>();
         private readonly System.Collections.Generic.Dictionary<Entity, bool> _gravelPrefabCache = new System.Collections.Generic.Dictionary<Entity, bool>();
 
-        private bool IsHighwayOrRamp(Entity roadEntity)
+        private static readonly string[] HighwayKeywords = { "Highway", "Freeway", "Motorway", "Ramp", "Sliproad", "Interchange" };
+        private static readonly string[] GravelKeywords = { "Gravel", "Dirt", "Unpaved" };
+
+        private bool HasDrivableCarLane(Entity roadEntity)
         {
-            if (EntityManager.HasComponent<PrefabRef>(roadEntity))
+            if (!EntityManager.HasBuffer<Game.Net.SubLane>(roadEntity))
+                return false;
+
+            var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(roadEntity);
+            for (int i = 0; i < subLanes.Length; i++)
             {
-                var prefabRef = EntityManager.GetComponentData<PrefabRef>(roadEntity);
-                var prefabEntity = prefabRef.m_Prefab;
-
-                if (prefabEntity != Entity.Null)
+                Entity subLane = subLanes[i].m_SubLane;
+                if (!EntityManager.HasComponent<Game.Net.CarLane>(subLane) ||
+                    EntityManager.HasComponent<Game.Net.SlaveLane>(subLane))
                 {
-                    if (_highwayPrefabCache.TryGetValue(prefabEntity, out bool cached))
-                        return cached;
-
-                    bool isHighway = false;
-                    if (_prefabSystem != null)
-                    {
-                        if (_prefabSystem.TryGetPrefab<PrefabBase>(prefabEntity, out var prefabBase) && prefabBase != null)
-                        {
-                            // 1. Check if RoadPrefab has m_HighwayRules == true
-                            if (prefabBase is RoadPrefab roadPrefab && roadPrefab.m_HighwayRules)
-                            {
-                                isHighway = true;
-                            }
-                            else
-                            {
-                                // 2. Check prefab name for highway, freeway, motorway, and ramp keywords
-                                string name = prefabBase.name;
-                                if (!string.IsNullOrEmpty(name))
-                                {
-                                    if (name.IndexOf("Highway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        name.IndexOf("Freeway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        name.IndexOf("Motorway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        name.IndexOf("Ramp", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        name.IndexOf("Sliproad", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        name.IndexOf("Interchange", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                                    {
-                                        isHighway = true;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            string pName = _prefabSystem.GetPrefabName(prefabEntity);
-                            if (!string.IsNullOrEmpty(pName))
-                            {
-                                if (pName.IndexOf("Highway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Freeway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Motorway", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Ramp", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Sliproad", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Interchange", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    isHighway = true;
-                                }
-                            }
-                        }
-                    }
-
-                    _highwayPrefabCache[prefabEntity] = isHighway;
-                    return isHighway;
+                    continue;
                 }
+
+                var carLane = EntityManager.GetComponentData<Game.Net.CarLane>(subLane);
+                if ((carLane.m_Flags & Game.Net.CarLaneFlags.Forbidden) != 0)
+                    continue;
+
+                if (EntityManager.HasComponent<PrefabRef>(subLane))
+                {
+                    Entity lanePrefab = EntityManager.GetComponentData<PrefabRef>(subLane).m_Prefab;
+                    if (lanePrefab != Entity.Null && EntityManager.HasComponent<CarLaneData>(lanePrefab))
+                    {
+                        var laneData = EntityManager.GetComponentData<CarLaneData>(lanePrefab);
+                        if ((laneData.m_RoadTypes & RoadTypes.Car) == 0)
+                            continue;
+                    }
+                }
+
+                return true;
             }
 
             return false;
+        }
+
+        private string GetRoadPrefabName(Entity prefabEntity)
+        {
+            if (_prefabSystem == null || prefabEntity == Entity.Null)
+                return null;
+
+            if (_prefabSystem.TryGetPrefab<PrefabBase>(prefabEntity, out var prefabBase) && prefabBase != null)
+                return prefabBase.name;
+
+            return _prefabSystem.GetPrefabName(prefabEntity);
+        }
+
+        private static bool ContainsAnyKeyword(string value, string[] keywords)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+
+            for (int i = 0; i < keywords.Length; i++)
+            {
+                if (value.IndexOf(keywords[i], System.StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool IsHighwayOrRamp(Entity roadEntity)
+        {
+            if (!EntityManager.HasComponent<PrefabRef>(roadEntity))
+                return false;
+
+            Entity prefabEntity = EntityManager.GetComponentData<PrefabRef>(roadEntity).m_Prefab;
+            if (prefabEntity == Entity.Null)
+                return false;
+
+            if (_highwayPrefabCache.TryGetValue(prefabEntity, out bool cached))
+                return cached;
+
+            bool isHighway = false;
+            if (_prefabSystem != null && _prefabSystem.TryGetPrefab<PrefabBase>(prefabEntity, out var prefabBase) &&
+                prefabBase is RoadPrefab roadPrefab && roadPrefab.m_HighwayRules)
+            {
+                isHighway = true;
+            }
+            else
+            {
+                isHighway = ContainsAnyKeyword(GetRoadPrefabName(prefabEntity), HighwayKeywords);
+            }
+
+            _highwayPrefabCache[prefabEntity] = isHighway;
+            return isHighway;
         }
 
         private bool IsGravelRoad(Entity roadEntity)
@@ -192,72 +224,34 @@ namespace AutoBusLines
                 {
                     var compData = EntityManager.GetComponentData<NetCompositionData>(comp.m_Edge);
                     if ((compData.m_Flags.m_General & CompositionFlags.General.Gravel) != 0)
-                    {
                         return true;
-                    }
                 }
             }
 
             // 2. Check PrefabRef
-            if (EntityManager.HasComponent<PrefabRef>(roadEntity))
+            if (!EntityManager.HasComponent<PrefabRef>(roadEntity))
+                return false;
+
+            Entity prefabEntity = EntityManager.GetComponentData<PrefabRef>(roadEntity).m_Prefab;
+            if (prefabEntity == Entity.Null)
+                return false;
+
+            if (_gravelPrefabCache.TryGetValue(prefabEntity, out bool cached))
+                return cached;
+
+            bool isGravel = false;
+            if (EntityManager.HasComponent<NetCompositionData>(prefabEntity))
             {
-                var prefabRef = EntityManager.GetComponentData<PrefabRef>(roadEntity);
-                var prefabEntity = prefabRef.m_Prefab;
-
-                if (prefabEntity != Entity.Null)
-                {
-                    if (_gravelPrefabCache.TryGetValue(prefabEntity, out bool cached))
-                        return cached;
-
-                    bool isGravel = false;
-
-                    // Check if the prefab has NetCompositionData
-                    if (EntityManager.HasComponent<NetCompositionData>(prefabEntity))
-                    {
-                        var compData = EntityManager.GetComponentData<NetCompositionData>(prefabEntity);
-                        if ((compData.m_Flags.m_General & CompositionFlags.General.Gravel) != 0)
-                        {
-                            isGravel = true;
-                        }
-                    }
-
-                    if (!isGravel && _prefabSystem != null)
-                    {
-                        // Check prefab name via PrefabSystem
-                        if (_prefabSystem.TryGetPrefab<PrefabBase>(prefabEntity, out var prefabBase) && prefabBase != null)
-                        {
-                            string name = prefabBase.name;
-                            if (!string.IsNullOrEmpty(name))
-                            {
-                                if (name.IndexOf("Gravel", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    name.IndexOf("Dirt", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    name.IndexOf("Unpaved", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    isGravel = true;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            string pName = _prefabSystem.GetPrefabName(prefabEntity);
-                            if (!string.IsNullOrEmpty(pName))
-                            {
-                                if (pName.IndexOf("Gravel", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Dirt", System.StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                    pName.IndexOf("Unpaved", System.StringComparison.OrdinalIgnoreCase) >= 0)
-                                {
-                                    isGravel = true;
-                                }
-                            }
-                        }
-                    }
-
-                    _gravelPrefabCache[prefabEntity] = isGravel;
-                    return isGravel;
-                }
+                var compData = EntityManager.GetComponentData<NetCompositionData>(prefabEntity);
+                if ((compData.m_Flags.m_General & CompositionFlags.General.Gravel) != 0)
+                    isGravel = true;
             }
 
-            return false;
+            if (!isGravel)
+                isGravel = ContainsAnyKeyword(GetRoadPrefabName(prefabEntity), GravelKeywords);
+
+            _gravelPrefabCache[prefabEntity] = isGravel;
+            return isGravel;
         }
 
         protected override void OnGameLoaded(Colossal.Serialization.Entities.Context serializationContext)
