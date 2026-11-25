@@ -46,7 +46,7 @@ namespace AutoBusLines
         public string HowToUse => string.Empty;
 
         [SettingsUISection(kSection, kVersionGroup)]
-        public string ModVersion => "2.0.6";
+        public string ModVersion => "2.0.7";
 
         // ==========================================
         // Backend / Custom UI Settings (Persisted to Disk)
@@ -57,7 +57,7 @@ namespace AutoBusLines
         public bool EnablePlanMode { get; set; } = true;
 
         [SettingsUIHidden]
-        public bool ExcludeDeadEnds { get; set; } = true;
+        public bool ExcludeDeadEnds { get; set; } = false;
 
         [SettingsUIHidden]
         public int DeadEndDistanceThreshold { get; set; } = 300;
@@ -183,7 +183,7 @@ namespace AutoBusLines
         public override void SetDefaults()
         {
             EnablePlanMode = true;
-            ExcludeDeadEnds = true;
+            ExcludeDeadEnds = false;
             DeadEndDistanceThreshold = 300;
             LineColoring = LineColorMode.PerStation;
             SelectedStopPrefab = "All";

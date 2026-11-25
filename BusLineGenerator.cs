@@ -1,4 +1,4 @@
-// AutoBusLines v2.0.6 - Modular transit planning and generation system
+// AutoBusLines v2.0.7 - Modular transit planning and generation system
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -218,8 +218,10 @@ namespace AutoBusLines
         {
             Idle,
             WaitingForCleanup,
+            InstantiatingStops,
             WaitingForStopIndexing,
-            InstantiatingRoutes
+            InstantiatingRoutes,
+            SettlingRoutes
         }
 
         private GenerationStage _generationStage = GenerationStage.Idle;
@@ -228,10 +230,18 @@ namespace AutoBusLines
         private int _createdLineCount = 0;
         private List<List<PlacedStop>> _plannedTours = new List<List<PlacedStop>>();
         private List<Color32> _plannedTourColors = new List<Color32>();
+        private List<Entity> _createdRouteEntities = new List<Entity>();
+        private int _settlingWaitCounter = 0;
+        private int _settlingPass = 0;
         private Entity _cachedBusLinePrefabEntity = Entity.Null;
         private RouteData _cachedBusLineRouteData;
         private int _totalStopsPlaced = 0;
         private int _totalStopsActive = 0;
+
+        private List<PlacedStop> _pendingVirtualStops = new List<PlacedStop>();
+        private Dictionary<int, Entity> _virtualToRealEntityMap = new Dictionary<int, Entity>();
+        private int _currentVirtualStopIndex = 0;
+        private int _totalVirtualStopsToCreate = 0;
 
         private bool _hasRun = false;
         private bool _isManualRequest = false;
@@ -438,7 +448,6 @@ namespace AutoBusLines
         {
             base.OnGameLoaded(serializationContext);
             ResetOnSaveLoad();
-            CleanLegacySubObjectStops();
         }
 
         public void ResetOnSaveLoad()
@@ -456,60 +465,19 @@ namespace AutoBusLines
             _currentPlanSeed = 0;
             _plannedTours.Clear();
             _plannedTourColors?.Clear();
+            _createdRouteEntities.Clear();
+            _settlingWaitCounter = 0;
+            _settlingPass = 0;
+            _pendingVirtualStops.Clear();
+            _virtualToRealEntityMap.Clear();
+            _currentVirtualStopIndex = 0;
+            _totalVirtualStopsToCreate = 0;
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "idle", "");
 
             _depotFinder?.Reset();
             _roadScanner?.Reset();
             _roadAssigner?.Reset();
             _districtBoundsCache.Clear();
-        }
-
-        private void CleanLegacySubObjectStops()
-        {
-            try
-            {
-                var stopQuery = GetEntityQuery(new EntityQueryDesc
-                {
-                    All = new ComponentType[]
-                    {
-                        ComponentType.ReadOnly<Game.Routes.BusStop>(),
-                        ComponentType.ReadOnly<Game.Objects.Attached>(),
-                    },
-                    None = new ComponentType[]
-                    {
-                        ComponentType.ReadOnly<Deleted>(),
-                        ComponentType.ReadOnly<Game.Tools.Temp>(),
-                    }
-                });
-
-                if (stopQuery.IsEmptyIgnoreFilter)
-                    return;
-
-                var stopEntities = stopQuery.ToEntityArray(Allocator.Temp);
-                var attachedArray = stopQuery.ToComponentDataArray<Game.Objects.Attached>(Allocator.Temp);
-
-                var cleanedRoads = new HashSet<Entity>();
-
-                for (int i = 0; i < stopEntities.Length; i++)
-                {
-                    var roadEntity = attachedArray[i].m_Parent;
-                    if (roadEntity != Entity.Null && EntityManager.Exists(roadEntity) && cleanedRoads.Add(roadEntity))
-                    {
-                        ClearRoadDeadEndNotifications(roadEntity);
-                    }
-                }
-
-                stopEntities.Dispose();
-                attachedArray.Dispose();
-
-                if (cleanedRoads.Count > 0)
-                {
-                    log.Info($"CleanLegacySubObjectStops: Cleaned legacy SubObject entries and unblocked road lanes on {cleanedRoads.Count} parent roads.");
-                }
-            }
-            catch (Exception ex)
-            {
-                log.Warn($"CleanLegacySubObjectStops encountered non-critical issue: {ex.Message}");
-            }
         }
 
         public void RequestGeneration()
@@ -523,6 +491,9 @@ namespace AutoBusLines
             _waitFrameCounter = 0;
             _currentTourIndex = 0;
             _plannedTours.Clear();
+            _createdRouteEntities.Clear();
+            _settlingWaitCounter = 0;
+            _settlingPass = 0;
             _depotFinder?.Reset();
             _roadScanner?.Reset();
             _roadAssigner?.Reset();
@@ -606,10 +577,107 @@ namespace AutoBusLines
                 return;
             }
 
+            // Stage 1.5: Incrementally instantiate virtual stops one-by-one across simulation frames
+            if (_generationStage == GenerationStage.InstantiatingStops)
+            {
+                int stopsProcessed = 0;
+                while (_pendingVirtualStops != null && _currentVirtualStopIndex < _pendingVirtualStops.Count && stopsProcessed < 2)
+                {
+                    var st = _pendingVirtualStops[_currentVirtualStopIndex];
+                    _currentVirtualStopIndex++;
+                    stopsProcessed++;
+
+                    if (EntityManager.Exists(st.RoadEntity) && !EntityManager.HasComponent<Deleted>(st.RoadEntity))
+                    {
+                        if (TryCreateBusStopEntity(st.RoadEntity, st.RoadT, st.Position, st.Forward, st.HubEntity,
+                                                   st.CorridorIndex, st.SpanOrderInCorridor, st.IsOutbound,
+                                                   st.PrefabEntity, out PlacedStop realPlacedStop))
+                        {
+                            _virtualToRealEntityMap[st.StopEntity.Index] = realPlacedStop.StopEntity;
+                        }
+                    }
+                }
+
+                float stopProgress = (float)_currentVirtualStopIndex / math.max(1, _totalVirtualStopsToCreate);
+                float overallProgress = stopProgress * 0.60f;
+                int pct = (int)math.round(stopProgress * 100f);
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(overallProgress, "building", $"Creating bus stop {_currentVirtualStopIndex} / {_totalVirtualStopsToCreate} ({pct}%)...");
+
+                if (_currentVirtualStopIndex < _pendingVirtualStops.Count)
+                    return;
+
+                // All virtual stops created! Assemble tours from _activePlan with newly created stop entities
+                var toursToBuild = new List<List<PlacedStop>>();
+                _plannedTourColors = new List<Color32>();
+
+                if (_activePlan != null)
+                {
+                    for (int r = 0; r < _activePlan.Count; r++)
+                    {
+                        var route = _activePlan[r];
+                        if (!route.Enabled) continue;
+
+                        var tourStops = new List<PlacedStop>();
+                        for (int sIdx = 0; sIdx < route.Stops.Count; sIdx++)
+                        {
+                            var stopData = route.Stops[sIdx];
+                            if (!stopData.Enabled) continue;
+
+                            var st = stopData.InternalStop;
+                            if (st.StopEntity.Index < 0)
+                            {
+                                if (_virtualToRealEntityMap.TryGetValue(st.StopEntity.Index, out Entity realStop))
+                                {
+                                    st.StopEntity = realStop;
+                                    if (realStop != Entity.Null && !string.IsNullOrEmpty(stopData.Name))
+                                    {
+                                        if (_nameSystem == null)
+                                            _nameSystem = World.GetOrCreateSystemManaged<Game.UI.NameSystem>();
+                                        _nameSystem?.SetCustomName(realStop, stopData.Name);
+                                    }
+                                    tourStops.Add(st);
+                                }
+                                else if (st.PrefabEntity == Entity.Null)
+                                {
+                                    st.StopEntity = Entity.Null;
+                                    tourStops.Add(st);
+                                }
+                            }
+                            else if (st.StopEntity == Entity.Null || (EntityManager.Exists(st.StopEntity) && !EntityManager.HasComponent<Deleted>(st.StopEntity)))
+                            {
+                                tourStops.Add(st);
+                            }
+                        }
+
+                        if (tourStops.Count >= ABSOLUTE_MIN_STOPS)
+                        {
+                            toursToBuild.Add(tourStops);
+                            _plannedTourColors.Add(HexToColor(route.Color));
+                        }
+                    }
+                }
+
+                _plannedTours = toursToBuild;
+                _totalStopsPlaced = _totalVirtualStopsToCreate;
+                _totalStopsActive = _totalVirtualStopsToCreate;
+                _pendingVirtualStops.Clear();
+                _virtualToRealEntityMap.Clear();
+                _activePlan = null;
+                _currentPlanSeed = 0;
+
+                _generationStage = GenerationStage.WaitingForStopIndexing;
+                _waitFrameCounter = 0;
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0.60f, "building", "Indexing bus stops and road geometry...");
+                return;
+            }
+
             // Stage 2: Wait for newly created bus stops to be indexed in the spatial world
             if (_generationStage == GenerationStage.WaitingForStopIndexing)
             {
                 _waitFrameCounter++;
+                float indexProgress = 0.60f + 0.10f * math.clamp(_waitFrameCounter / (float)INDEXING_DELAY_FRAMES, 0f, 1f);
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(indexProgress, "building", "Indexing bus stops and road geometry...");
+
                 if (_waitFrameCounter >= INDEXING_DELAY_FRAMES)
                 {
                     _generationStage = GenerationStage.InstantiatingRoutes;
@@ -621,19 +689,19 @@ namespace AutoBusLines
                 return;
             }
 
-            // Stage 3: Incrementally instantiate bus lines across simulation frames
+            // Stage 3: Incrementally instantiate bus lines one-by-one across simulation frames
             if (_generationStage == GenerationStage.InstantiatingRoutes)
             {
-                int routesCreatedThisTick = 0;
-                while (_currentTourIndex < _plannedTours.Count && routesCreatedThisTick < ROUTES_PER_FRAME)
+                if (_currentTourIndex < _plannedTours.Count)
                 {
                     var tour = _plannedTours[_currentTourIndex];
+                    int nextLineNumber = _createdLineCount + 1;
+                    Color32? tourColor = (_plannedTourColors != null && _currentTourIndex < _plannedTourColors.Count)
+                        ? _plannedTourColors[_currentTourIndex]
+                        : (Color32?)null;
+
                     if (tour.Count >= ABSOLUTE_MIN_STOPS)
                     {
-                        int nextLineNumber = _createdLineCount + 1;
-                        Color32? tourColor = (_plannedTourColors != null && _currentTourIndex < _plannedTourColors.Count)
-                            ? _plannedTourColors[_currentTourIndex]
-                            : (Color32?)null;
                         if (CreateBusLine(_cachedBusLinePrefabEntity, _cachedBusLineRouteData, tour, nextLineNumber, 0, _currentTourIndex, tourColor))
                         {
                             _createdLineCount++;
@@ -645,22 +713,227 @@ namespace AutoBusLines
                             log.Warn($"Stage 3: Skipped creating Bus Line for tour #{_currentTourIndex + 1} due to insufficient valid stops.");
                         }
                     }
+
                     _currentTourIndex++;
-                    routesCreatedThisTick++;
+                    float routeProgress = (float)_currentTourIndex / math.max(1, _plannedTours.Count);
+                    float overallProgress = 0.70f + routeProgress * 0.25f;
+                    int pct = (int)math.round(routeProgress * 100f);
+                    AutoBusLinesUISystem.Instance?.SetBuildProgress(overallProgress, "building", $"Building bus line {_currentTourIndex} / {_plannedTours.Count} ({pct}%)...");
+                    return; // Yield to next frame: 1 line per frame gives pathfinding and engine route creation full time to settle
                 }
 
-                if (_currentTourIndex >= _plannedTours.Count)
+                // Transition to Stage 4: SettlingRoutes to allow async PathfindQueueSystem threads to complete and verify paths
+                _generationStage = GenerationStage.SettlingRoutes;
+                _settlingWaitCounter = 0;
+                _settlingPass = 0;
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0.95f, "building", "Verifying route pathfinding and road connections...");
+                log.Info($"Stage 3 Complete: {_createdLineCount} bus lines created. Transitioning to Stage 4 (Settling & Path Verification) for {_createdRouteEntities.Count} routes...");
+                return;
+            }
+
+            // Stage 4: Verify asynchronous pathfinding and auto-recover any broken segments
+            if (_generationStage == GenerationStage.SettlingRoutes)
+            {
+                _settlingWaitCounter++;
+                if (_settlingWaitCounter < 25)
                 {
-                    int lineCount = _createdLineCount;
-                    log.Info($"=== Generation Complete: Successfully created {lineCount} bus lines across city neighborhoods ({_totalStopsActive}/{_totalStopsPlaced} stops active across staged simulation frames). ===");
-                    _generationStage = GenerationStage.Idle;
-                    _hasRun = true;
-                    _isManualRequest = false;
-                    _plannedTours.Clear();
-
-                    AutoBusLinesUISystem.Instance?.UpdatePlan(null, 0, $"Successfully built {lineCount} bus lines!");
-                    AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", $"Successfully built {lineCount} bus lines!");
+                    return; // Wait 25 frames between verification passes to allow background pathfinding threads to complete
                 }
+
+                _settlingWaitCounter = 0;
+                _settlingPass++;
+
+                int totalBrokenSegments = 0;
+                var brokenSegmentsToReset = new HashSet<Entity>();
+                var routesWithBrokenSegments = new HashSet<Entity>();
+                var stopsToNudge = new HashSet<Entity>();
+                var curbsideWaypointsToNudge = new HashSet<Entity>();
+
+                for (int r = 0; r < _createdRouteEntities.Count; r++)
+                {
+                    var routeEnt = _createdRouteEntities[r];
+                    if (!EntityManager.Exists(routeEnt) || EntityManager.HasComponent<Deleted>(routeEnt))
+                        continue;
+
+                    if (!EntityManager.HasBuffer<RouteSegment>(routeEnt) || !EntityManager.HasBuffer<RouteWaypoint>(routeEnt))
+                        continue;
+
+                    var segBuf = EntityManager.GetBuffer<RouteSegment>(routeEnt);
+                    var wpBuf = EntityManager.GetBuffer<RouteWaypoint>(routeEnt);
+
+                    if (segBuf.Length == 0 || wpBuf.Length == 0)
+                        continue;
+
+                    bool routeHasBroken = false;
+                    for (int s = 0; s < segBuf.Length; s++)
+                    {
+                        var segEnt = segBuf[s].m_Segment;
+                        if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
+                        {
+                            routeHasBroken = true;
+                            totalBrokenSegments++;
+                            continue;
+                        }
+
+                        bool isBroken = false;
+                        if (EntityManager.HasComponent<PathInformation>(segEnt))
+                        {
+                            var pi = EntityManager.GetComponentData<PathInformation>(segEnt);
+                            if (pi.m_Distance <= 0f)
+                            {
+                                isBroken = true;
+                            }
+                        }
+                        else
+                        {
+                            isBroken = true;
+                        }
+
+                        if (!EntityManager.HasBuffer<PathElement>(segEnt) || EntityManager.GetBuffer<PathElement>(segEnt).Length == 0)
+                        {
+                            isBroken = true;
+                        }
+
+                        if (isBroken)
+                        {
+                            routeHasBroken = true;
+                            totalBrokenSegments++;
+                            brokenSegmentsToReset.Add(segEnt);
+
+                            // The failed segment connects Waypoint s to Waypoint (s + 1) % wpBuf.Length
+                            int wpIndexA = s;
+                            int wpIndexB = (s + 1) % wpBuf.Length;
+
+                            if (wpIndexA < wpBuf.Length)
+                            {
+                                var wpA = wpBuf[wpIndexA].m_Waypoint;
+                                if (EntityManager.Exists(wpA) && !EntityManager.HasComponent<Deleted>(wpA))
+                                {
+                                    if (!EntityManager.HasComponent<Updated>(wpA))
+                                        EntityManager.AddComponentData(wpA, default(Updated));
+
+                                    if (EntityManager.HasComponent<Connected>(wpA))
+                                    {
+                                        var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
+                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA))
+                                        {
+                                            stopsToNudge.Add(stopA);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        curbsideWaypointsToNudge.Add(wpA);
+                                    }
+                                }
+                            }
+
+                            if (wpIndexB < wpBuf.Length)
+                            {
+                                var wpB = wpBuf[wpIndexB].m_Waypoint;
+                                if (EntityManager.Exists(wpB) && !EntityManager.HasComponent<Deleted>(wpB))
+                                {
+                                    if (!EntityManager.HasComponent<Updated>(wpB))
+                                        EntityManager.AddComponentData(wpB, default(Updated));
+
+                                    if (EntityManager.HasComponent<Connected>(wpB))
+                                    {
+                                        var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
+                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB))
+                                        {
+                                            stopsToNudge.Add(stopB);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        curbsideWaypointsToNudge.Add(wpB);
+                                    }
+                                }
+                            }
+
+                            // Also reset adjacent segments touching these two waypoints
+                            int prevSegIdx = (s - 1 + segBuf.Length) % segBuf.Length;
+                            int nextSegIdx = (s + 1) % segBuf.Length;
+                            if (prevSegIdx < segBuf.Length)
+                                brokenSegmentsToReset.Add(segBuf[prevSegIdx].m_Segment);
+                            if (nextSegIdx < segBuf.Length)
+                                brokenSegmentsToReset.Add(segBuf[nextSegIdx].m_Segment);
+                        }
+                    }
+
+                    if (routeHasBroken)
+                    {
+                        routesWithBrokenSegments.Add(routeEnt);
+                    }
+                }
+
+                if (totalBrokenSegments > 0 && _settlingPass <= 3)
+                {
+                    log.Info($"SettlingRoutes Pass {_settlingPass}: Found {totalBrokenSegments} incomplete/broken segments across {routesWithBrokenSegments.Count} routes. Re-enqueuing...");
+
+                    // If pass >= 2 and physical roadside stops failed, nudge them along road curve to adjust curb position
+                    if (_settlingPass >= 2)
+                    {
+                        foreach (var stopEntity in stopsToNudge)
+                        {
+                            NudgeRoadsideBusStop(stopEntity);
+                        }
+                        foreach (var wpEntity in curbsideWaypointsToNudge)
+                        {
+                            NudgeCurbsideWaypoint(wpEntity);
+                        }
+                    }
+
+                    // Reset PathTargets and PathInformation on affected segments
+                    foreach (var segEnt in brokenSegmentsToReset)
+                    {
+                        if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
+                            continue;
+
+                        if (EntityManager.HasComponent<PathTargets>(segEnt))
+                            EntityManager.SetComponentData(segEnt, new PathTargets());
+
+                        if (EntityManager.HasComponent<PathInformation>(segEnt))
+                            EntityManager.SetComponentData(segEnt, default(PathInformation));
+
+                        if (EntityManager.HasBuffer<PathElement>(segEnt))
+                            EntityManager.GetBuffer<PathElement>(segEnt).Clear();
+
+                        if (EntityManager.HasBuffer<CurveElement>(segEnt))
+                            EntityManager.GetBuffer<CurveElement>(segEnt).Clear();
+
+                        if (!EntityManager.HasComponent<Updated>(segEnt))
+                            EntityManager.AddComponentData(segEnt, default(Updated));
+                    }
+
+                    foreach (var rEnt in routesWithBrokenSegments)
+                    {
+                        if (!EntityManager.Exists(rEnt) || EntityManager.HasComponent<Deleted>(rEnt))
+                            continue;
+
+                        if (!EntityManager.HasComponent<Updated>(rEnt))
+                            EntityManager.AddComponentData(rEnt, default(Updated));
+                        if (!EntityManager.HasComponent<BatchesUpdated>(rEnt))
+                            EntityManager.AddComponentData(rEnt, default(BatchesUpdated));
+                    }
+
+                    float settleProgress = 0.95f + 0.01f * _settlingPass;
+                    AutoBusLinesUISystem.Instance?.SetBuildProgress(settleProgress, "building", $"Resolving route pathfinding (pass {_settlingPass}/3, {totalBrokenSegments} segments remaining)...");
+                    return; // Wait next 25 frames
+                }
+
+                if (totalBrokenSegments > 0)
+                    LogBrokenSegmentDiagnostics(_createdRouteEntities, "SettlingFinal");
+
+                int lineCount = _createdLineCount;
+                log.Info($"=== Generation Complete: Successfully created {lineCount} bus lines across city neighborhoods ({_totalStopsActive}/{_totalStopsPlaced} stops active across staged simulation frames). Broken segments remaining: {totalBrokenSegments}. ===");
+                _generationStage = GenerationStage.Idle;
+                _hasRun = true;
+                _isManualRequest = false;
+                _plannedTours.Clear();
+                _createdRouteEntities.Clear();
+
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(1f, "idle", $"Successfully built {lineCount} bus lines with {_totalStopsPlaced} stops!");
+                AutoBusLinesUISystem.Instance?.UpdatePlan(null, 0, $"Successfully built {lineCount} bus lines with {_totalStopsPlaced} stops!");
                 return;
             }
 
@@ -817,7 +1090,7 @@ namespace AutoBusLines
 
             float servedRadius = targetSpacing * 0.85f;
             float minCollisionSpacing = math.clamp(targetSpacing * 0.40f, 35f, 120f);
-            float minSpanLength = math.min(MIN_SEGMENT_LENGTH_FOR_STOP, targetSpacing * 0.5f);
+            float minSpanLength = math.clamp(targetSpacing * 0.20f, 20f, 35f);
 
             var allCorridors = BuildCorridors();
             allCorridors.Sort((a, b) => b.TotalLength.CompareTo(a.TotalLength));
@@ -990,6 +1263,35 @@ namespace AutoBusLines
                         roadPos = span.MidPosition;
                         roadTan = span.MidTangent;
 
+                        // If span.MidEdge has a very short curve (< 14m) or is bridge, pick the longest edge in the span
+                        if (EntityManager.HasComponent<Curve>(roadEdge))
+                        {
+                            var midCurve = EntityManager.GetComponentData<Curve>(roadEdge);
+                            if (MathUtils.Length(midCurve.m_Bezier) < 14.0f && span.Edges.Count > 1)
+                            {
+                                float maxLen = 0f;
+                                for (int e = 0; e < span.Edges.Count; e++)
+                                {
+                                    var cand = span.Edges[e].EdgeEntity;
+                                    if (cand != Entity.Null && EntityManager.HasComponent<Curve>(cand) && !IsElevatedOrBridge(cand))
+                                    {
+                                        var candCurve = EntityManager.GetComponentData<Curve>(cand);
+                                        float candLen = MathUtils.Length(candCurve.m_Bezier);
+                                        if (candLen > maxLen)
+                                        {
+                                            maxLen = candLen;
+                                            roadEdge = cand;
+                                            edgeT = 0.5f;
+                                            roadPos = MathUtils.Position(candCurve.m_Bezier, 0.5f);
+                                            float3 cTan = MathUtils.Tangent(candCurve.m_Bezier, 0.5f);
+                                            if (span.Edges[e].IsReversed) cTan = -cTan;
+                                            roadTan = math.normalizesafe(cTan, new float3(0, 0, 1));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // If the span's midpoint edge happens to be a bridge or drawbridge, search for an alternative non-bridge edge in the span
                         if (IsElevatedOrBridge(roadEdge))
                         {
@@ -1043,7 +1345,7 @@ namespace AutoBusLines
                     bool isAlreadyServed = false;
                     for (int k = 0; k < committedStops.Count; k++)
                     {
-                        float checkDist = (committedStops[k].SpanId == span.SpanId) ? minCollisionSpacing : servedRadius;
+                        float checkDist = (committedStops[k].SpanId == span.SpanId) ? minCollisionSpacing : 25.0f;
                         if (math.distance(roadPos, committedStops[k].Position) < checkDist)
                         {
                             isAlreadyServed = true;
@@ -1276,6 +1578,7 @@ namespace AutoBusLines
             _totalStopsActive = servedStopEntities.Count;
             _generationStage = GenerationStage.WaitingForStopIndexing;
             _waitFrameCounter = 0;
+            AutoBusLinesUISystem.Instance?.SetBuildProgress(0.60f, "building", "Indexing bus stops and road geometry...");
 
             log.Info($"Stage 1 Complete: Placed {_totalStopsPlaced} roadside bus stops and planned {_plannedTours.Count} bus lines. Yielding {INDEXING_DELAY_FRAMES} simulation frames for spatial quadtrees and net indexing to settle before drawing routes...");
             return;

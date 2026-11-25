@@ -544,6 +544,18 @@ namespace AutoBusLines
 
                                 if (roadOwner != Entity.Null && EntityManager.Exists(roadOwner) && EntityManager.HasComponent<Edge>(roadOwner))
                                 {
+                                    if (EntityManager.HasBuffer<Game.Objects.SubObject>(roadOwner))
+                                    {
+                                        var subObjects = EntityManager.GetBuffer<Game.Objects.SubObject>(roadOwner);
+                                        for (int s = subObjects.Length - 1; s >= 0; s--)
+                                        {
+                                            if (subObjects[s].m_SubObject == stopEntity)
+                                            {
+                                                subObjects.RemoveAt(s);
+                                            }
+                                        }
+                                        MarkRoadUpdatedWithNodes(roadOwner);
+                                    }
                                     ClearRoadDeadEndNotifications(roadOwner);
                                 }
 
@@ -666,6 +678,7 @@ namespace AutoBusLines
             var stopsToNudge = new HashSet<Entity>();
             var segmentsToReset = new HashSet<Entity>();
             var routesToUpdate = new HashSet<Entity>();
+            var scannedBusRoutes = new List<Entity>();
 
             using (var routeEntities = lineQuery.ToEntityArray(Allocator.Temp))
             {
@@ -687,6 +700,7 @@ namespace AutoBusLines
                         continue;
 
                     totalRoutesExamined++;
+                    scannedBusRoutes.Add(routeEntity);
 
                     if (!EntityManager.HasBuffer<RouteSegment>(routeEntity) || !EntityManager.HasBuffer<RouteWaypoint>(routeEntity))
                         continue;
@@ -741,12 +755,20 @@ namespace AutoBusLines
                             if (wpIndexA < wpBuf.Length)
                             {
                                 var wpA = wpBuf[wpIndexA].m_Waypoint;
-                                if (EntityManager.Exists(wpA) && !EntityManager.HasComponent<Deleted>(wpA) && EntityManager.HasComponent<Connected>(wpA))
+                                if (EntityManager.Exists(wpA) && !EntityManager.HasComponent<Deleted>(wpA))
                                 {
-                                    var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
-                                    if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA))
+                                    if (EntityManager.HasComponent<Connected>(wpA))
                                     {
-                                        stopsToNudge.Add(stopA);
+                                        var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
+                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA))
+                                        {
+                                            stopsToNudge.Add(stopA);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (!EntityManager.HasComponent<Updated>(wpA))
+                                            EntityManager.AddComponentData(wpA, default(Updated));
                                     }
                                 }
                             }
@@ -754,12 +776,20 @@ namespace AutoBusLines
                             if (wpIndexB < wpBuf.Length)
                             {
                                 var wpB = wpBuf[wpIndexB].m_Waypoint;
-                                if (EntityManager.Exists(wpB) && !EntityManager.HasComponent<Deleted>(wpB) && EntityManager.HasComponent<Connected>(wpB))
+                                if (EntityManager.Exists(wpB) && !EntityManager.HasComponent<Deleted>(wpB))
                                 {
-                                    var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
-                                    if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB))
+                                    if (EntityManager.HasComponent<Connected>(wpB))
                                     {
-                                        stopsToNudge.Add(stopB);
+                                        var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
+                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB))
+                                        {
+                                            stopsToNudge.Add(stopB);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (!EntityManager.HasComponent<Updated>(wpB))
+                                            EntityManager.AddComponentData(wpB, default(Updated));
                                     }
                                 }
                             }
@@ -790,6 +820,8 @@ namespace AutoBusLines
                 return;
             }
 
+            LogBrokenSegmentDiagnostics(scannedBusRoutes, "ManualRepair");
+
             // 1. Nudge problematic roadside bus stops along their road curves
             foreach (var stopEntity in stopsToNudge)
             {
@@ -807,11 +839,7 @@ namespace AutoBusLines
 
                 if (EntityManager.HasComponent<PathTargets>(segEnt))
                 {
-                    var pt = EntityManager.GetComponentData<PathTargets>(segEnt);
-                    pt.m_StartLane = Entity.Null;
-                    pt.m_EndLane = Entity.Null;
-                    pt.m_CurvePositions = default;
-                    EntityManager.SetComponentData(segEnt, pt);
+                    EntityManager.SetComponentData(segEnt, new PathTargets());
                 }
 
                 if (EntityManager.HasComponent<PathInformation>(segEnt))
@@ -944,14 +972,54 @@ namespace AutoBusLines
                 toRoad = -normal;
             quaternion newRot = quaternion.LookRotationSafe(toRoad, new float3(0, 1, 0));
 
+            Entity stopPrefabEntity = EntityManager.HasComponent<PrefabRef>(stopEntity)
+                ? EntityManager.GetComponentData<PrefabRef>(stopEntity).m_Prefab
+                : Entity.Null;
+            bool isRightSide = sideDot >= 0f;
+            float finalAttachedT = newT;
+            if (TrySnapToRoadCurbArea(roadEntity, newT, newRoadPos, normal, isRightSide, stopPrefabEntity,
+                    out float3 areaPos, out quaternion areaRot, out float areaT, out _))
+            {
+                newStopPos = areaPos;
+                newRot = areaRot;
+                finalAttachedT = areaT;
+            }
+
+            SyncStopElevationWithRoad(stopEntity, roadEntity);
+
             // Apply updated Attached and Transform to stop
-            EntityManager.SetComponentData(stopEntity, new Attached(roadEntity, Entity.Null, newT));
+            EntityManager.SetComponentData(stopEntity, new Attached(roadEntity, Entity.Null, finalAttachedT));
             EntityManager.SetComponentData(stopEntity, new Game.Objects.Transform(newStopPos, newRot));
 
             if (!EntityManager.HasComponent<Updated>(stopEntity))
                 EntityManager.AddComponentData(stopEntity, default(Updated));
             if (!EntityManager.HasComponent<BatchesUpdated>(stopEntity))
                 EntityManager.AddComponentData(stopEntity, default(BatchesUpdated));
+
+            // Ensure roadEntity maintains stopEntity in its SubObject buffer
+            if (EntityManager.HasBuffer<Game.Objects.SubObject>(roadEntity))
+            {
+                var roadSubObjects = EntityManager.GetBuffer<Game.Objects.SubObject>(roadEntity);
+                bool found = false;
+                for (int s = 0; s < roadSubObjects.Length; s++)
+                {
+                    if (roadSubObjects[s].m_SubObject == stopEntity)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    roadSubObjects.Add(new Game.Objects.SubObject(stopEntity));
+                }
+            }
+            else
+            {
+                var roadSubObjects = EntityManager.AddBuffer<Game.Objects.SubObject>(roadEntity);
+                roadSubObjects.Add(new Game.Objects.SubObject(stopEntity));
+            }
+            MarkRoadUpdatedWithNodes(roadEntity);
 
             // Clean up any legacy DeadEnd warnings on parent road
             ClearRoadDeadEndNotifications(roadEntity);
@@ -978,29 +1046,92 @@ namespace AutoBusLines
             return true;
         }
 
+        /// <summary>
+        /// Marks a road edge and its endpoint/middle-connected nodes Updated together so CS2's
+        /// LaneSystem and LaneReferencesSystem preserve skipped pass-through lane stitching across
+        /// adjacent edges, and strips any lingering SubObjectsUpdated component from the road entity
+        /// (which CleanUpSystem never removes and which belongs only on transient Event entities).
+        /// </summary>
+        private void MarkRoadUpdatedWithNodes(Entity roadEntity)
+        {
+            if (roadEntity == Entity.Null || !EntityManager.Exists(roadEntity) || EntityManager.HasComponent<Deleted>(roadEntity))
+                return;
+
+            if (EntityManager.HasComponent<Game.Objects.SubObjectsUpdated>(roadEntity))
+                EntityManager.RemoveComponent<Game.Objects.SubObjectsUpdated>(roadEntity);
+
+            if (!EntityManager.HasComponent<Updated>(roadEntity))
+                EntityManager.AddComponentData(roadEntity, default(Updated));
+
+            if (EntityManager.HasComponent<Game.Net.Edge>(roadEntity))
+            {
+                var edge = EntityManager.GetComponentData<Game.Net.Edge>(roadEntity);
+                MarkEntityUpdatedIfValid(edge.m_Start);
+                MarkEntityUpdatedIfValid(edge.m_End);
+            }
+
+            if (EntityManager.HasBuffer<Game.Net.ConnectedNode>(roadEntity))
+            {
+                var connectedNodes = EntityManager.GetBuffer<Game.Net.ConnectedNode>(roadEntity);
+                for (int i = 0; i < connectedNodes.Length; i++)
+                {
+                    MarkEntityUpdatedIfValid(connectedNodes[i].m_Node);
+                }
+            }
+        }
+
+        private void MarkEntityUpdatedIfValid(Entity entity)
+        {
+            if (entity != Entity.Null && EntityManager.Exists(entity) && !EntityManager.HasComponent<Deleted>(entity) &&
+                !EntityManager.HasComponent<Updated>(entity))
+            {
+                EntityManager.AddComponentData(entity, default(Updated));
+            }
+        }
+
+        private bool NudgeCurbsideWaypoint(Entity wpEntity)
+        {
+            if (!EntityManager.Exists(wpEntity) || EntityManager.HasComponent<Deleted>(wpEntity))
+                return false;
+
+            if (!EntityManager.HasComponent<RouteLane>(wpEntity) || !EntityManager.HasComponent<Game.Routes.Position>(wpEntity))
+                return false;
+
+            var routeLane = EntityManager.GetComponentData<RouteLane>(wpEntity);
+            if (routeLane.m_StartLane == Entity.Null || !EntityManager.Exists(routeLane.m_StartLane) || !EntityManager.HasComponent<Curve>(routeLane.m_StartLane))
+                return false;
+
+            var laneCurve = EntityManager.GetComponentData<Curve>(routeLane.m_StartLane);
+            float laneLen = MathUtils.Length(laneCurve.m_Bezier);
+            if (laneLen < 2.0f)
+                return false;
+
+            float curT = routeLane.m_StartCurvePos;
+            float deltaT = 3.0f / laneLen;
+            float newT = (curT < 0.45f) ? (curT + deltaT) : (curT - deltaT);
+            newT = math.clamp(newT, 0.05f, 0.95f);
+
+            routeLane.m_StartCurvePos = newT;
+            routeLane.m_EndCurvePos = newT;
+            if (routeLane.m_EndLane == Entity.Null)
+                routeLane.m_EndLane = routeLane.m_StartLane;
+            if (routeLane.m_StartLane == Entity.Null)
+                routeLane.m_StartLane = routeLane.m_EndLane;
+            EntityManager.SetComponentData(wpEntity, routeLane);
+
+            float3 newPos = MathUtils.Position(laneCurve.m_Bezier, newT);
+            EntityManager.SetComponentData(wpEntity, new Game.Routes.Position(newPos));
+
+            if (!EntityManager.HasComponent<Updated>(wpEntity))
+                EntityManager.AddComponentData(wpEntity, default(Updated));
+
+            return true;
+        }
+
         private void ClearRoadDeadEndNotifications(Entity roadEntity)
         {
             if (roadEntity == Entity.Null || !EntityManager.Exists(roadEntity))
                 return;
-
-            // Clean up any incorrect SubObject buffer entries on roadEntity
-            if (EntityManager.HasBuffer<Game.Objects.SubObject>(roadEntity))
-            {
-                var subObjs = EntityManager.GetBuffer<Game.Objects.SubObject>(roadEntity);
-                for (int so = subObjs.Length - 1; so >= 0; so--)
-                {
-                    var sub = subObjs[so].m_SubObject;
-                    if (EntityManager.Exists(sub) && (EntityManager.HasComponent<Game.Routes.BusStop>(sub) || EntityManager.HasComponent<Game.Routes.TransportStop>(sub)))
-                    {
-                        subObjs.RemoveAt(so);
-                    }
-                }
-            }
-
-            if (EntityManager.HasComponent<SubObjectsUpdated>(roadEntity))
-            {
-                EntityManager.RemoveComponent<SubObjectsUpdated>(roadEntity);
-            }
 
             // Look up TrafficConfigurationData singleton to identify m_DeadEndNotification
             var trafficConfigQuery = GetEntityQuery(ComponentType.ReadOnly<TrafficConfigurationData>());
@@ -1067,10 +1198,13 @@ namespace AutoBusLines
                 return;
             }
 
-            var virtualToRealEntityMap = new Dictionary<int, Entity>();
-            var toursToBuild = new List<List<PlacedStop>>();
-            _plannedTourColors = new List<Color32>();
-            int totalNewStopsBuilt = 0;
+            _cachedBusLinePrefabEntity = busLinePrefabEntity;
+            _cachedBusLineRouteData = busLineRouteData;
+
+            // Collect unique virtual stops that need to be instantiated into the world
+            var uniqueVirtualStops = new List<PlacedStop>();
+            var virtualStopSet = new HashSet<int>();
+            _virtualToRealEntityMap = new Dictionary<int, Entity>();
 
             for (int r = 0; r < _activePlan.Count; r++)
             {
@@ -1078,104 +1212,111 @@ namespace AutoBusLines
                 if (!route.Enabled)
                     continue;
 
-                var enabledStops = route.Stops.FindAll(s => s.Enabled);
-                if (enabledStops.Count < ABSOLUTE_MIN_STOPS)
+                for (int sIdx = 0; sIdx < route.Stops.Count; sIdx++)
                 {
-                    log.Warn($"Skipping Line #{route.Id}: only {enabledStops.Count} stops enabled (minimum {ABSOLUTE_MIN_STOPS} required).");
-                    continue;
-                }
+                    var stopData = route.Stops[sIdx];
+                    if (!stopData.Enabled)
+                        continue;
 
-                var tourStops = new List<PlacedStop>();
-                for (int sIdx = 0; sIdx < enabledStops.Count; sIdx++)
-                {
-                    var stopData = enabledStops[sIdx];
                     var st = stopData.InternalStop;
-
-                    if (st.StopEntity.Index < 0)
+                    if (st.StopEntity.Index < 0 && virtualStopSet.Add(st.StopEntity.Index))
                     {
-                        // Issue #2: verify road entity still exists before attempting to place stop
-                        if (!EntityManager.Exists(st.RoadEntity) || EntityManager.HasComponent<Deleted>(st.RoadEntity))
+                        if (st.RoadEntity != Entity.Null && EntityManager.Exists(st.RoadEntity) && !EntityManager.HasComponent<Deleted>(st.RoadEntity))
                         {
-                            log.Warn($"Skipping virtual stop on road {st.RoadEntity.Index} for route #{route.Id}: road entity was deleted or demolished.");
-                            continue;
-                        }
-
-                        // Virtual stop that needs to be created in ECS
-                        if (!virtualToRealEntityMap.TryGetValue(st.StopEntity.Index, out Entity realStopEntity))
-                        {
-                            if (TryCreateBusStopEntity(st.RoadEntity, st.RoadT, st.Position, st.Forward, st.HubEntity,
-                                                       st.CorridorIndex, st.SpanOrderInCorridor, st.IsOutbound,
-                                                       st.PrefabEntity, out PlacedStop realPlacedStop))
+                            if (st.PrefabEntity == Entity.Null || !EntityManager.Exists(st.PrefabEntity))
                             {
-                                realStopEntity = realPlacedStop.StopEntity;
-                                virtualToRealEntityMap[st.StopEntity.Index] = realStopEntity;
-                                st.StopEntity = realStopEntity;
-                                totalNewStopsBuilt++;
-
-                                if (!string.IsNullOrEmpty(stopData.Name))
+                                FindBusStopPrefabs(out var candidatePrefabs, out _);
+                                Entity signPrefab = Entity.Null;
+                                for (int p = 0; p < candidatePrefabs.Count; p++)
                                 {
-                                    if (_nameSystem == null)
-                                        _nameSystem = World.GetOrCreateSystemManaged<Game.UI.NameSystem>();
-                                    _nameSystem?.SetCustomName(realStopEntity, stopData.Name);
+                                    if (IsBusStopSign(candidatePrefabs[p]))
+                                    {
+                                        signPrefab = candidatePrefabs[p];
+                                        break;
+                                    }
                                 }
+                                if (signPrefab == Entity.Null && candidatePrefabs.Count > 0)
+                                    signPrefab = candidatePrefabs[0];
+
+                                st.PrefabEntity = signPrefab;
+                            }
+
+                            if (st.PrefabEntity != Entity.Null)
+                            {
+                                uniqueVirtualStops.Add(st);
                             }
                             else
                             {
-                                log.Error($"Failed to instantiate bus stop on road {st.RoadEntity.Index} for route #{route.Id}.");
-                                continue;
+                                _virtualToRealEntityMap[st.StopEntity.Index] = Entity.Null;
                             }
                         }
-                        else
-                        {
-                            st.StopEntity = realStopEntity;
-                        }
                     }
-                    else
-                    {
-                        // Issue #2: verify pre-existing stop entity still exists in ECS
-                        if (!EntityManager.Exists(st.StopEntity) || EntityManager.HasComponent<Deleted>(st.StopEntity))
-                        {
-                            log.Warn($"Skipping pre-existing stop {st.StopEntity.Index} for route #{route.Id}: entity no longer exists or was demolished.");
-                            continue;
-                        }
-                    }
-                    tourStops.Add(st);
-                }
-
-                // Issue #3 & #4: Associate colors 1:1 with toursToBuild at the exact moment of adding tour
-                if (tourStops.Count >= ABSOLUTE_MIN_STOPS)
-                {
-                    toursToBuild.Add(tourStops);
-                    _plannedTourColors.Add(HexToColor(route.Color));
-                }
-                else
-                {
-                    log.Warn($"Route #{route.Id} dropped: only {tourStops.Count} valid stops remained after pruning deleted entities (minimum {ABSOLUTE_MIN_STOPS} required).");
                 }
             }
 
-            if (toursToBuild.Count == 0)
-            {
-                log.Warn("No valid bus lines remained after filtering disabled stops and routes.");
-                AutoBusLinesUISystem.Instance?.SetPlanStatus("idle", "No valid bus lines remained to build.");
-                return;
-            }
-
-            log.Info($"Building Selected Plan: Instantiating {toursToBuild.Count} bus lines with {totalNewStopsBuilt} newly created bus stops in ECS...");
-
-            _plannedTours = toursToBuild;
-            _cachedBusLinePrefabEntity = busLinePrefabEntity;
-            _cachedBusLineRouteData = busLineRouteData;
-            _totalStopsPlaced = totalNewStopsBuilt;
-            _totalStopsActive = totalNewStopsBuilt;
+            _pendingVirtualStops = uniqueVirtualStops;
+            _currentVirtualStopIndex = 0;
+            _totalVirtualStopsToCreate = uniqueVirtualStops.Count;
             _currentTourIndex = 0;
             _createdLineCount = 0;
             _waitFrameCounter = 0;
-            _activePlan = null;
-            _currentPlanSeed = 0;
+            _createdRouteEntities.Clear();
+            _settlingWaitCounter = 0;
+            _settlingPass = 0;
 
-            _generationStage = GenerationStage.WaitingForStopIndexing;
-            AutoBusLinesUISystem.Instance?.SetPlanStatus("building", $"Building {toursToBuild.Count} selected bus lines in city...");
+            if (_totalVirtualStopsToCreate > 0)
+            {
+                _generationStage = GenerationStage.InstantiatingStops;
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0f, "building", $"Creating bus stop 0 / {_totalVirtualStopsToCreate} (0%)...");
+                log.Info($"Building Selected Plan: Beginning staged instantiation of {_totalVirtualStopsToCreate} bus stops across frames...");
+            }
+            else
+            {
+                // All stops pre-existing or curbside; directly assemble tours
+                var toursToBuild = new List<List<PlacedStop>>();
+                _plannedTourColors = new List<Color32>();
+
+                for (int r = 0; r < _activePlan.Count; r++)
+                {
+                    var route = _activePlan[r];
+                    if (!route.Enabled) continue;
+
+                    var tourStops = new List<PlacedStop>();
+                    for (int sIdx = 0; sIdx < route.Stops.Count; sIdx++)
+                    {
+                        var stopData = route.Stops[sIdx];
+                        if (!stopData.Enabled) continue;
+                        var st = stopData.InternalStop;
+                        if (st.StopEntity.Index < 0)
+                        {
+                            if (_virtualToRealEntityMap != null && _virtualToRealEntityMap.TryGetValue(st.StopEntity.Index, out Entity realStop))
+                            {
+                                st.StopEntity = realStop;
+                            }
+                            else if (st.PrefabEntity == Entity.Null)
+                            {
+                                st.StopEntity = Entity.Null;
+                            }
+                        }
+                        if (st.StopEntity == Entity.Null || st.StopEntity.Index <= 0 || (EntityManager.Exists(st.StopEntity) && !EntityManager.HasComponent<Deleted>(st.StopEntity)))
+                        {
+                            tourStops.Add(st);
+                        }
+                    }
+
+                    if (tourStops.Count >= ABSOLUTE_MIN_STOPS)
+                    {
+                        toursToBuild.Add(tourStops);
+                        _plannedTourColors.Add(HexToColor(route.Color));
+                    }
+                }
+
+                _plannedTours = toursToBuild;
+                _activePlan = null;
+                _currentPlanSeed = 0;
+                _generationStage = GenerationStage.WaitingForStopIndexing;
+                AutoBusLinesUISystem.Instance?.SetBuildProgress(0.60f, "building", "Indexing bus stops and road geometry...");
+            }
         }
 
         private bool FindBusLinePrefab(out Entity prefabEntity, out RouteData routeData)
@@ -1521,6 +1662,116 @@ namespace AutoBusLines
             return list;
         }
 
+        private bool TryFindCarLane(Entity roadEnt, float3 stopPos, float roadT, out Entity bestLane, out float bestT, out float3 lanePos, bool? preferForward = null, float3? stopForward = null)
+        {
+            bestLane = Entity.Null;
+            bestT = roadT;
+            lanePos = stopPos;
+
+            if (roadEnt == Entity.Null || !EntityManager.Exists(roadEnt) || !EntityManager.HasComponent<Curve>(roadEnt))
+                return false;
+
+            var roadCurve = EntityManager.GetComponentData<Curve>(roadEnt);
+            lanePos = MathUtils.Position(roadCurve.m_Bezier, roadT);
+
+            if (EntityManager.HasBuffer<Game.Net.SubLane>(roadEnt))
+            {
+                var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(roadEnt);
+                float bestDistSq = float.MaxValue;
+                Curve bestCurve = default;
+
+                bool hasStopForward = stopForward.HasValue && math.lengthsq(stopForward.Value.xz) > 0.001f;
+
+                // Pass 0: direction-matched candidate (matching stopForward or preferForward)
+                // Pass 1: any valid car lane on road
+                for (int pass = (hasStopForward || preferForward.HasValue ? 0 : 1); pass < 2; pass++)
+                {
+                    for (int l = 0; l < subLanes.Length; l++)
+                    {
+                        Entity subLane = subLanes[l].m_SubLane;
+                        // Exclude SlaveLane (vehicles only drive and pathfind on MasterLane / primary CarLane)
+                        if (EntityManager.HasComponent<Game.Net.SlaveLane>(subLane))
+                            continue;
+
+                        if (!EntityManager.HasComponent<Game.Net.CarLane>(subLane) ||
+                            !EntityManager.HasComponent<Curve>(subLane))
+                            continue;
+
+                        var carLane = EntityManager.GetComponentData<Game.Net.CarLane>(subLane);
+                        if ((carLane.m_Flags & (Game.Net.CarLaneFlags.Unsafe | Game.Net.CarLaneFlags.SideConnection | Game.Net.CarLaneFlags.Forbidden)) != 0)
+                            continue;
+
+                        if (EntityManager.HasComponent<PrefabRef>(subLane))
+                        {
+                            Entity lanePrefab = EntityManager.GetComponentData<PrefabRef>(subLane).m_Prefab;
+                            if (EntityManager.HasComponent<CarLaneData>(lanePrefab))
+                            {
+                                var laneData = EntityManager.GetComponentData<CarLaneData>(lanePrefab);
+                                if ((laneData.m_RoadTypes & Game.Net.RoadTypes.Car) == 0)
+                                    continue;
+                                if ((int)laneData.m_MaxSize < (int)SizeClass.Large)
+                                    continue;
+                            }
+                        }
+
+                        var laneCurve = EntityManager.GetComponentData<Curve>(subLane);
+                        float dist = MathUtils.Distance(laneCurve.m_Bezier.xz, stopPos.xz, out float t);
+
+                        if (pass == 0)
+                        {
+                            if (hasStopForward)
+                            {
+                                float3 laneDir = math.normalizesafe(MathUtils.Tangent(laneCurve.m_Bezier, t));
+                                if (math.dot(laneDir.xz, stopForward.Value.xz) < 0.2f)
+                                    continue;
+                            }
+                            else if (preferForward.HasValue)
+                            {
+                                bool isTwoway = (carLane.m_Flags & Game.Net.CarLaneFlags.Twoway) != 0;
+                                bool isInvert = (carLane.m_Flags & Game.Net.CarLaneFlags.Invert) != 0;
+                                if (!isTwoway)
+                                {
+                                    if (preferForward.Value && isInvert)
+                                        continue;
+                                    if (!preferForward.Value && !isInvert)
+                                        continue;
+                                }
+                            }
+                        }
+
+                        float dSq = dist * dist;
+                        if (dSq < bestDistSq)
+                        {
+                            bestDistSq = dSq;
+                            bestLane = subLane;
+                            bestCurve = laneCurve;
+                            bestT = t;
+                        }
+                    }
+
+                    if (bestLane != Entity.Null)
+                        break;
+                }
+
+                if (bestLane != Entity.Null)
+                {
+                    lanePos = MathUtils.Position(bestCurve.m_Bezier, bestT);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool AreStopsSame(PlacedStop a, PlacedStop b)
+        {
+            if (a.StopEntity != Entity.Null && b.StopEntity != Entity.Null && a.StopEntity.Index > 0 && b.StopEntity.Index > 0)
+                return a.StopEntity == b.StopEntity;
+            if (a.RoadEntity != Entity.Null && b.RoadEntity != Entity.Null && a.RoadEntity == b.RoadEntity)
+                return math.abs(a.RoadT - b.RoadT) < 0.05f;
+            return math.distancesq(a.Position, b.Position) < 4f;
+        }
+
         private List<PlacedStop> BuildTourFromRoadCycle(
             List<DirectedRoadEdge> cycleEdges,
             Dictionary<Entity, List<PlacedStop>> edgeForwardStops,
@@ -1539,15 +1790,34 @@ namespace AutoBusLines
                     for (int s = 0; s < stops.Count; s++)
                     {
                         var stop = stops[s];
-                        if (inTour.Add(stop.StopEntity))
+                        if (stop.StopEntity != Entity.Null && stop.StopEntity.Index > 0)
                         {
-                            tour.Add(stop);
+                            if (inTour.Add(stop.StopEntity))
+                            {
+                                tour.Add(stop);
+                            }
+                        }
+                        else
+                        {
+                            bool duplicate = false;
+                            for (int t = 0; t < tour.Count; t++)
+                            {
+                                if (AreStopsSame(tour[t], stop))
+                                {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (!duplicate)
+                            {
+                                tour.Add(stop);
+                            }
                         }
                     }
                 }
             }
 
-            if (tour.Count > 1 && tour[tour.Count - 1].StopEntity == tour[0].StopEntity)
+            if (tour.Count > 1 && AreStopsSame(tour[tour.Count - 1], tour[0]))
                 tour.RemoveAt(tour.Count - 1);
 
             if (tour.Count > maxStops)
@@ -1575,7 +1845,12 @@ namespace AutoBusLines
                 return false;
 
             // 1. Prune any stops that may have been demolished between planning and building
-            orderedStops.RemoveAll(s => !EntityManager.Exists(s.StopEntity) || EntityManager.HasComponent<Deleted>(s.StopEntity));
+            orderedStops.RemoveAll(s =>
+            {
+                if (s.StopEntity != Entity.Null && s.StopEntity.Index > 0)
+                    return !EntityManager.Exists(s.StopEntity) || EntityManager.HasComponent<Deleted>(s.StopEntity);
+                return s.RoadEntity == Entity.Null || !EntityManager.Exists(s.RoadEntity) || EntityManager.HasComponent<Deleted>(s.RoadEntity);
+            });
             if (orderedStops.Count < ABSOLUTE_MIN_STOPS)
             {
                 log.Warn($"CreateBusLine: Line #{lineNumber} aborted because fewer than {ABSOLUTE_MIN_STOPS} valid stops exist ({orderedStops.Count} found).");
@@ -1587,11 +1862,11 @@ namespace AutoBusLines
             for (int i = 0; i < orderedStops.Count; i++)
             {
                 var s = orderedStops[i];
-                if (uniqueStops.Count > 0 && uniqueStops[uniqueStops.Count - 1].StopEntity == s.StopEntity)
+                if (uniqueStops.Count > 0 && AreStopsSame(uniqueStops[uniqueStops.Count - 1], s))
                     continue;
                 uniqueStops.Add(s);
             }
-            if (uniqueStops.Count > 1 && uniqueStops[0].StopEntity == uniqueStops[uniqueStops.Count - 1].StopEntity)
+            if (uniqueStops.Count > 1 && AreStopsSame(uniqueStops[0], uniqueStops[uniqueStops.Count - 1]))
             {
                 uniqueStops.RemoveAt(uniqueStops.Count - 1);
             }
@@ -1645,7 +1920,7 @@ namespace AutoBusLines
             for (int i = 0; i < uniqueStops.Count; i++)
             {
                 var stop = uniqueStops[i];
-                if (!stop.IsStationBay && EntityManager.Exists(stop.StopEntity) && !EntityManager.HasComponent<Deleted>(stop.StopEntity))
+                if (!stop.IsStationBay && stop.StopEntity != Entity.Null && stop.StopEntity.Index > 0 && EntityManager.Exists(stop.StopEntity) && !EntityManager.HasComponent<Deleted>(stop.StopEntity))
                 {
                     string street = stopStreetNames[i] ?? "Road";
                     int totalOnStreet = streetCounts[street];
@@ -1666,42 +1941,121 @@ namespace AutoBusLines
                 }
             }
 
-            // 4. Create connected Waypoints referencing placed stops with strict sequential indexing.
+            // 4. Create Waypoints referencing placed stops with strict sequential indexing.
             // Critical Fix: Waypoint(wpIndex) MUST use waypointEntities.Count (0..N-1) rather than the raw loop index,
             // otherwise skipped stops create non-contiguous indices that cause WaypointConnectionSystem and RoutePathSystem
             // to access out-of-bounds segment buffer indices in Burst jobs -> Hard Crash To Desktop (CTD).
+            // Waypoint Archetype Handling:
+            // - Stops with physical shelters/signs: use m_ConnectedArchetype and set Connected(stop.StopEntity)
+            // - Curbside stops (open curbs / no shelter): use m_WaypointArchetype (NO Connected, NO VehicleTiming, NO Attached)
             var waypointEntities = new List<Entity>(uniqueStops.Count);
             for (int i = 0; i < uniqueStops.Count; i++)
             {
                 var stop = uniqueStops[i];
-                if (!EntityManager.Exists(stop.StopEntity) || EntityManager.HasComponent<Deleted>(stop.StopEntity))
-                    continue;
+                bool hasPhysicalStop = stop.StopEntity != Entity.Null && stop.StopEntity.Index > 0 && EntityManager.Exists(stop.StopEntity) && !EntityManager.HasComponent<Deleted>(stop.StopEntity);
+
+                // Fallback: If stop reached route creation without a physical stop entity (e.g. legacy plan or curbside mode),
+                // instantiate a curbside bus stop sign entity on the road now to guarantee valid transit connectivity.
+                if (!hasPhysicalStop)
+                {
+                    if (stop.RoadEntity == Entity.Null || !EntityManager.Exists(stop.RoadEntity) || EntityManager.HasComponent<Deleted>(stop.RoadEntity))
+                        continue;
+
+                    Entity signPrefab = stop.PrefabEntity;
+                    if (signPrefab == Entity.Null || !EntityManager.Exists(signPrefab))
+                    {
+                        FindBusStopPrefabs(out var prefabs, out _);
+                        for (int p = 0; p < prefabs.Count; p++)
+                        {
+                            if (IsBusStopSign(prefabs[p]))
+                            {
+                                signPrefab = prefabs[p];
+                                break;
+                            }
+                        }
+                        if (signPrefab == Entity.Null && prefabs.Count > 0)
+                            signPrefab = prefabs[0];
+                    }
+
+                    if (signPrefab != Entity.Null && TryCreateBusStopEntity(stop.RoadEntity, stop.RoadT, stop.Position, stop.Forward, stop.HubEntity, stop.CorridorIndex, stop.SpanOrderInCorridor, stop.IsOutbound, signPrefab, out PlacedStop createdStop))
+                    {
+                        stop.StopEntity = createdStop.StopEntity;
+                        stop.PrefabEntity = signPrefab;
+                        uniqueStops[i] = stop;
+                        hasPhysicalStop = true;
+                    }
+                }
 
                 int wpIndex = waypointEntities.Count;
-                Entity wpEntity = EntityManager.CreateEntity(routeData.m_ConnectedArchetype);
+                Entity wpEntity;
+
+                // Resolve best car lane and snapped position for both physical and curbside stops
+                Entity roadEntity = stop.RoadEntity;
+                if (roadEntity == Entity.Null && hasPhysicalStop && EntityManager.HasComponent<Attached>(stop.StopEntity))
+                {
+                    roadEntity = EntityManager.GetComponentData<Attached>(stop.StopEntity).m_Parent;
+                }
+
+                bool servesForward = StopServesEdgeForward(stop);
+                Entity bestLane = Entity.Null;
+                float bestT = stop.RoadT;
+                float3 snappedPos = stop.Position;
+
+                if (roadEntity != Entity.Null && EntityManager.Exists(roadEntity))
+                {
+                    if (!hasPhysicalStop && TryFindCarLane(roadEntity, stop.Position, stop.RoadT, out bestLane, out bestT, out float3 lPos, servesForward, stop.Forward))
+                    {
+                        snappedPos = lPos;
+                    }
+                    else if (!hasPhysicalStop && EntityManager.HasComponent<Curve>(roadEntity))
+                    {
+                        var rCurve = EntityManager.GetComponentData<Curve>(roadEntity);
+                        snappedPos = MathUtils.Position(rCurve.m_Bezier, stop.RoadT);
+                    }
+                }
+
+                float3 finalWpPos = hasPhysicalStop
+                    ? stop.Position
+                    : ((bestLane != Entity.Null) ? snappedPos : stop.Position);
+                if (hasPhysicalStop)
+                {
+                    wpEntity = EntityManager.CreateEntity(routeData.m_ConnectedArchetype);
+                    EntityManager.SetComponentData(wpEntity, new Game.Routes.Connected(stop.StopEntity));
+
+                    // Ensure the ConnectedRoute buffer exists on the stop entity.
+                    // Vanilla WaypointConnectionSystem automatically registers every Waypoint that has the Created component into
+                    // the stop's ConnectedRoute buffer. Manually adding it causes duplicate entries.
+                    if (!EntityManager.HasBuffer<ConnectedRoute>(stop.StopEntity))
+                        EntityManager.AddBuffer<ConnectedRoute>(stop.StopEntity);
+
+                    EntityManager.SetComponentData(wpEntity, new Game.Routes.Position(finalWpPos));
+                }
+                else
+                {
+                    // Curbside stop fallback: create with m_WaypointArchetype (NO Connected component, NO VehicleTiming component, NO Attached component)
+                    wpEntity = EntityManager.CreateEntity(routeData.m_WaypointArchetype);
+                    EntityManager.SetComponentData(wpEntity, new Game.Routes.Position(finalWpPos));
+                }
+
+                // For unconnected curbside waypoints, initialize RouteLane directly on the car lane.
+                // For physical Connected stops, let CS2's WaypointConnectionSystem resolve AccessLane,
+                // RouteLane, MoveLaneOffsets, and ValidateConnection from the stop entity.
+                if (!hasPhysicalStop && bestLane != Entity.Null && EntityManager.HasComponent<RouteLane>(wpEntity))
+                {
+                    EntityManager.SetComponentData(wpEntity, new RouteLane(bestLane, bestLane, bestT, bestT));
+                }
 
                 EntityManager.SetComponentData(wpEntity, new PrefabRef(busLinePrefabEntity));
                 EntityManager.SetComponentData(wpEntity, new Game.Routes.Waypoint(wpIndex));
-                EntityManager.SetComponentData(wpEntity, new Game.Routes.Position(stop.Position));
                 EntityManager.SetComponentData(wpEntity, new Game.Common.Owner(routeEntity));
-                EntityManager.SetComponentData(wpEntity, new Game.Routes.Connected(stop.StopEntity));
 
+                // Lifecycle components matching vanilla route waypoint creation
                 if (!EntityManager.HasComponent<Created>(wpEntity))
                     EntityManager.AddComponentData(wpEntity, default(Created));
                 if (!EntityManager.HasComponent<Updated>(wpEntity))
                     EntityManager.AddComponentData(wpEntity, default(Updated));
 
                 waypointEntities.Add(wpEntity);
-
-                // Ensure the ConnectedRoute buffer exists on the stop entity.
-                // Do NOT manually add to ConnectedRoute here: vanilla WaypointConnectionSystem
-                // will automatically register every Waypoint that has the Created component into
-                // the stop's ConnectedRoute buffer. Manually adding it causes duplicate entries.
-                if (!EntityManager.HasBuffer<ConnectedRoute>(stop.StopEntity))
-                    EntityManager.AddBuffer<ConnectedRoute>(stop.StopEntity);
-
-                if (!EntityManager.HasComponent<Updated>(stop.StopEntity))
-                    EntityManager.AddComponentData(stop.StopEntity, default(Updated));
             }
 
             // Abort guard if too few valid waypoints were instantiated
@@ -1725,6 +2079,12 @@ namespace AutoBusLines
                 EntityManager.SetComponentData(segEntity, new PrefabRef(busLinePrefabEntity));
                 EntityManager.SetComponentData(segEntity, new Game.Routes.Segment(i));
                 EntityManager.SetComponentData(segEntity, new Game.Common.Owner(routeEntity));
+
+                // Initialize PathTargets with clean defaults matching vanilla m_SegmentArchetype
+                if (EntityManager.HasComponent<PathTargets>(segEntity))
+                {
+                    EntityManager.SetComponentData(segEntity, new PathTargets());
+                }
 
                 if (!EntityManager.HasBuffer<Game.Routes.CurveElement>(segEntity))
                     EntityManager.AddBuffer<Game.Routes.CurveElement>(segEntity);
@@ -1755,7 +2115,846 @@ namespace AutoBusLines
             if (!EntityManager.HasComponent<BatchesUpdated>(routeEntity))
                 EntityManager.AddComponentData(routeEntity, default(BatchesUpdated));
 
+            _createdRouteEntities.Add(routeEntity);
+
             return true;
+        }
+
+        /// <summary>
+        /// Synchronizes <see cref="Game.Objects.Elevation"/> on a stop entity with its attached road's <see cref="Game.Net.Elevation"/>.
+        /// Removes any stale object elevation when the road has zero or no elevation.
+        /// </summary>
+        private void SyncStopElevationWithRoad(Entity stopEntity, Entity roadEntity)
+        {
+            if (EntityManager.HasComponent<Game.Net.Elevation>(roadEntity))
+            {
+                var netElev = EntityManager.GetComponentData<Game.Net.Elevation>(roadEntity);
+                if (math.any(netElev.m_Elevation != 0f))
+                {
+                    float elevVal = math.csum(netElev.m_Elevation) * 0.5f;
+                    var elevFlags = (netElev.m_Elevation.x < 0f && netElev.m_Elevation.y < 0f)
+                        ? Game.Objects.ElevationFlags.Lowered
+                        : Game.Objects.ElevationFlags.OnAttachedParent;
+                    var elevComp = new Game.Objects.Elevation(elevVal, elevFlags);
+                    if (EntityManager.HasComponent<Game.Objects.Elevation>(stopEntity))
+                        EntityManager.SetComponentData(stopEntity, elevComp);
+                    else
+                        EntityManager.AddComponentData(stopEntity, elevComp);
+                    return;
+                }
+            }
+
+            if (EntityManager.HasComponent<Game.Objects.Elevation>(stopEntity))
+                EntityManager.RemoveComponent<Game.Objects.Elevation>(stopEntity);
+        }
+
+        private struct BrokenDiagSample
+        {
+            public int RouteIndex;
+            public int SegmentIndex;
+            public Entity RouteEntity;
+            public Entity SegmentEntity;
+            public Entity WaypointA;
+            public Entity WaypointB;
+        }
+
+        private struct EndpointDiagFlags
+        {
+            public Entity StopEntity;
+            public Entity RoadEntity;
+            public Entity LaneEntity;
+            public bool NoRouteLane;
+            public bool NoAccessLane;
+            public bool StopDetached;
+            public bool NotInRoadSubObjects;
+            public bool CarLaneSlaveOrUnsafe;
+        }
+
+        /// <summary>
+        /// Logs categorized failure counts and detailed ECS component diagnostics for broken bus route segments
+        /// alongside a small sample of healthy segments for side-by-side comparison.
+        /// </summary>
+        private void LogBrokenSegmentDiagnostics(IReadOnlyList<Entity> routeEntities, string contextLabel)
+        {
+            if (routeEntities == null || routeEntities.Count == 0)
+                return;
+
+            var prefabSystem = World.GetExistingSystemManaged<PrefabSystem>();
+
+            int totalBusRoutes = 0;
+            int totalSegments = 0;
+            int brokenSegments = 0;
+            int missingPathInfo = 0;
+            int distLeZero = 0;
+            int emptyPathElem = 0;
+            int wpNoRouteLane = 0;
+            int wpNoAccessLane = 0;
+            int stopDetached = 0;
+            int stopNotInRoadSubObjects = 0;
+            int carLaneSlaveOrUnsafe = 0;
+
+            var brokenSamples = new List<BrokenDiagSample>(12);
+            var passingSamples = new List<BrokenDiagSample>(3);
+
+            for (int r = 0; r < routeEntities.Count; r++)
+            {
+                Entity routeEntity = routeEntities[r];
+                if (routeEntity == Entity.Null || !EntityManager.Exists(routeEntity))
+                    continue;
+                if (!EntityManager.HasBuffer<RouteWaypoint>(routeEntity) || !EntityManager.HasBuffer<RouteSegment>(routeEntity))
+                    continue;
+                if (!IsBusRouteEntity(routeEntity))
+                    continue;
+
+                totalBusRoutes++;
+                var waypoints = EntityManager.GetBuffer<RouteWaypoint>(routeEntity);
+                var segments = EntityManager.GetBuffer<RouteSegment>(routeEntity);
+                if (waypoints.Length == 0 || segments.Length == 0)
+                    continue;
+
+                for (int s = 0; s < segments.Length; s++)
+                {
+                    Entity segEntity = segments[s].m_Segment;
+                    if (segEntity == Entity.Null || !EntityManager.Exists(segEntity))
+                        continue;
+
+                    totalSegments++;
+                    Entity wpA = s < waypoints.Length ? waypoints[s].m_Waypoint : Entity.Null;
+                    Entity wpB = waypoints[(s + 1) % waypoints.Length].m_Waypoint;
+
+                    bool hasPathInfo = EntityManager.HasComponent<Game.Pathfind.PathInformation>(segEntity);
+                    float dist = hasPathInfo ? EntityManager.GetComponentData<Game.Pathfind.PathInformation>(segEntity).m_Distance : -1f;
+                    int pathElemLen = EntityManager.HasBuffer<Game.Pathfind.PathElement>(segEntity)
+                        ? EntityManager.GetBuffer<Game.Pathfind.PathElement>(segEntity).Length
+                        : 0;
+
+                    bool isBroken = !hasPathInfo || dist <= 0f || pathElemLen == 0;
+                    if (isBroken)
+                    {
+                        brokenSegments++;
+                        if (!hasPathInfo) missingPathInfo++;
+                        else if (dist <= 0f) distLeZero++;
+                        if (pathElemLen == 0) emptyPathElem++;
+
+                        var flagsA = InspectEndpointDiag(wpA, isDeparture: true);
+                        var flagsB = InspectEndpointDiag(wpB, isDeparture: false);
+
+                        if (flagsA.NoRouteLane || flagsB.NoRouteLane) wpNoRouteLane++;
+                        if (flagsA.NoAccessLane || flagsB.NoAccessLane) wpNoAccessLane++;
+                        if (flagsA.StopDetached || flagsB.StopDetached) stopDetached++;
+                        if (flagsA.NotInRoadSubObjects || flagsB.NotInRoadSubObjects) stopNotInRoadSubObjects++;
+                        if (flagsA.CarLaneSlaveOrUnsafe || flagsB.CarLaneSlaveOrUnsafe) carLaneSlaveOrUnsafe++;
+
+                        if (brokenSamples.Count < 12)
+                        {
+                            brokenSamples.Add(new BrokenDiagSample
+                            {
+                                RouteIndex = r,
+                                SegmentIndex = s,
+                                RouteEntity = routeEntity,
+                                SegmentEntity = segEntity,
+                                WaypointA = wpA,
+                                WaypointB = wpB
+                            });
+                        }
+                    }
+                    else if (passingSamples.Count < 3)
+                    {
+                        passingSamples.Add(new BrokenDiagSample
+                        {
+                            RouteIndex = r,
+                            SegmentIndex = s,
+                            RouteEntity = routeEntity,
+                            SegmentEntity = segEntity,
+                            WaypointA = wpA,
+                            WaypointB = wpB
+                        });
+                    }
+                }
+            }
+
+            log.Info($"[BrokenDiag][{contextLabel}] Summary: routes={totalBusRoutes}, segments={totalSegments}, broken={brokenSegments} " +
+                     $"(missingPathInfo={missingPathInfo}, distLeZero={distLeZero}, emptyPathElem={emptyPathElem}, " +
+                     $"wp_noRouteLane={wpNoRouteLane}, wp_noAccessLane={wpNoAccessLane}, stop_detached={stopDetached}, " +
+                     $"stop_notInRoadSubObjects={stopNotInRoadSubObjects}, carLaneSlaveOrUnsafe={carLaneSlaveOrUnsafe})");
+
+            for (int i = 0; i < brokenSamples.Count; i++)
+                LogSegmentDiagSample(contextLabel, "FAIL", i + 1, brokenSamples[i], prefabSystem);
+
+            for (int i = 0; i < passingSamples.Count; i++)
+                LogSegmentDiagSample(contextLabel, "PASS", i + 1, passingSamples[i], prefabSystem);
+        }
+
+        private bool IsBusRouteEntity(Entity routeEntity)
+        {
+            if (!EntityManager.HasComponent<PrefabRef>(routeEntity))
+                return false;
+
+            Entity prefab = EntityManager.GetComponentData<PrefabRef>(routeEntity).m_Prefab;
+            if (prefab == Entity.Null || !EntityManager.HasComponent<TransportLineData>(prefab))
+                return false;
+
+            return EntityManager.GetComponentData<TransportLineData>(prefab).m_TransportType == Game.Prefabs.TransportType.Bus;
+        }
+
+        private EndpointDiagFlags InspectEndpointDiag(Entity wp, bool isDeparture)
+        {
+            var flags = new EndpointDiagFlags();
+            if (wp == Entity.Null || !EntityManager.Exists(wp))
+            {
+                flags.NoRouteLane = true;
+                flags.NoAccessLane = true;
+                return flags;
+            }
+
+            if (EntityManager.HasComponent<RouteLane>(wp))
+            {
+                var rl = EntityManager.GetComponentData<RouteLane>(wp);
+                flags.LaneEntity = isDeparture ? rl.m_StartLane : rl.m_EndLane;
+                flags.NoRouteLane = rl.m_StartLane == Entity.Null || rl.m_EndLane == Entity.Null;
+            }
+            else
+            {
+                flags.NoRouteLane = true;
+            }
+
+            if (EntityManager.HasComponent<AccessLane>(wp))
+                flags.NoAccessLane = EntityManager.GetComponentData<AccessLane>(wp).m_Lane == Entity.Null;
+            else
+                flags.NoAccessLane = true;
+
+            if (EntityManager.HasComponent<Connected>(wp))
+                flags.StopEntity = EntityManager.GetComponentData<Connected>(wp).m_Connected;
+
+            if (flags.StopEntity != Entity.Null && EntityManager.Exists(flags.StopEntity))
+            {
+                if (EntityManager.HasComponent<Attached>(flags.StopEntity))
+                {
+                    flags.RoadEntity = EntityManager.GetComponentData<Attached>(flags.StopEntity).m_Parent;
+                    if (flags.RoadEntity == Entity.Null)
+                        flags.StopDetached = true;
+                }
+                else
+                {
+                    flags.StopDetached = true;
+                }
+
+                if (flags.RoadEntity != Entity.Null && EntityManager.Exists(flags.RoadEntity))
+                    flags.NotInRoadSubObjects = !IsEntityInSubObjects(flags.RoadEntity, flags.StopEntity);
+            }
+
+            if (flags.LaneEntity != Entity.Null && EntityManager.Exists(flags.LaneEntity))
+            {
+                bool hasCarLane = EntityManager.HasComponent<Game.Net.CarLane>(flags.LaneEntity);
+                bool isSlave = EntityManager.HasComponent<Game.Net.SlaveLane>(flags.LaneEntity);
+                bool isUnsafe = hasCarLane && (EntityManager.GetComponentData<Game.Net.CarLane>(flags.LaneEntity).m_Flags & Game.Net.CarLaneFlags.Unsafe) != 0;
+                flags.CarLaneSlaveOrUnsafe = !hasCarLane || isSlave || isUnsafe;
+            }
+
+            return flags;
+        }
+
+        private bool IsEntityInSubObjects(Entity parentEntity, Entity childEntity)
+        {
+            if (parentEntity == Entity.Null || !EntityManager.HasBuffer<Game.Objects.SubObject>(parentEntity))
+                return false;
+
+            var subObjects = EntityManager.GetBuffer<Game.Objects.SubObject>(parentEntity);
+            for (int i = 0; i < subObjects.Length; i++)
+            {
+                if (subObjects[i].m_SubObject == childEntity)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private string SafePrefabName(PrefabSystem prefabSystem, Entity entity)
+        {
+            if (entity == Entity.Null || !EntityManager.Exists(entity) || !EntityManager.HasComponent<PrefabRef>(entity))
+                return "none";
+
+            Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+            if (prefab == Entity.Null)
+                return "nullPrefab";
+
+            if (prefabSystem != null)
+            {
+                string name = prefabSystem.GetPrefabName(prefab);
+                if (!string.IsNullOrEmpty(name))
+                    return name;
+            }
+
+            return prefab.ToString();
+        }
+
+        private void LogSegmentDiagSample(string contextLabel, string kind, int sampleNum, BrokenDiagSample sample, PrefabSystem prefabSystem)
+        {
+            Entity seg = sample.SegmentEntity;
+            string pathInfoStr = "none";
+            if (EntityManager.HasComponent<Game.Pathfind.PathInformation>(seg))
+            {
+                var pi = EntityManager.GetComponentData<Game.Pathfind.PathInformation>(seg);
+                pathInfoStr = $"dist={pi.m_Distance:F2},dur={pi.m_Duration:F2},state={pi.m_State},orig={pi.m_Origin},dest={pi.m_Destination}";
+            }
+
+            string pathTargetsStr = "none";
+            if (EntityManager.HasComponent<Game.Routes.PathTargets>(seg))
+            {
+                var pt = EntityManager.GetComponentData<Game.Routes.PathTargets>(seg);
+                pathTargetsStr = $"startLane={pt.m_StartLane},endLane={pt.m_EndLane},curve={pt.m_CurvePositions},readyA={pt.m_ReadyStartPosition},readyB={pt.m_ReadyEndPosition}";
+            }
+
+            int pathElems = EntityManager.HasBuffer<Game.Pathfind.PathElement>(seg) ? EntityManager.GetBuffer<Game.Pathfind.PathElement>(seg).Length : -1;
+            int curveElems = EntityManager.HasBuffer<Game.Routes.CurveElement>(seg) ? EntityManager.GetBuffer<Game.Routes.CurveElement>(seg).Length : -1;
+
+            if (sampleNum == 1 && kind == "FAIL")
+                LogPrefabGeometryTable(prefabSystem);
+
+            log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}] rIdx={sample.RouteIndex},sIdx={sample.SegmentIndex},route={sample.RouteEntity},seg={seg} " +
+                     $"PathInfo=({pathInfoStr}) PathTargets=({pathTargetsStr}) pathElems={pathElems} curveElems={curveElems}");
+            log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   EndpointA: {FormatEndpointDiag(sample.WaypointA, isDeparture: true, prefabSystem)}");
+            log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   EndpointB: {FormatEndpointDiag(sample.WaypointB, isDeparture: false, prefabSystem)}");
+            if (sampleNum <= 3)
+                LogLaneConnectivityDiag(contextLabel, kind, sampleNum, sample.WaypointA, sample.WaypointB);
+        }
+
+        private string FormatEndpointDiag(Entity wp, bool isDeparture, PrefabSystem prefabSystem)
+        {
+            if (wp == Entity.Null || !EntityManager.Exists(wp))
+                return "wp=null";
+
+            string wpPos = EntityManager.HasComponent<Game.Routes.Position>(wp)
+                ? EntityManager.GetComponentData<Game.Routes.Position>(wp).m_Position.ToString()
+                : "none";
+
+            string rlStr = "none";
+            Entity targetLane = Entity.Null;
+            if (EntityManager.HasComponent<RouteLane>(wp))
+            {
+                var rl = EntityManager.GetComponentData<RouteLane>(wp);
+                targetLane = isDeparture ? rl.m_StartLane : rl.m_EndLane;
+                rlStr = $"{rl.m_StartLane}({rl.m_StartCurvePos:F2})->{rl.m_EndLane}({rl.m_EndCurvePos:F2})";
+            }
+
+            string alStr = "none";
+            if (EntityManager.HasComponent<AccessLane>(wp))
+            {
+                var al = EntityManager.GetComponentData<AccessLane>(wp);
+                alStr = $"{al.m_Lane}({al.m_CurvePos:F2})";
+            }
+
+            Entity stopEntity = EntityManager.HasComponent<Connected>(wp)
+                ? EntityManager.GetComponentData<Connected>(wp).m_Connected
+                : Entity.Null;
+
+            string stopStr = FormatStopDiag(stopEntity, prefabSystem, out Entity roadEntity);
+            string roadStr = FormatRoadDiag(roadEntity, stopEntity, prefabSystem);
+            string laneStr = FormatLaneDiag(targetLane);
+
+            return $"wp={wp} pos={wpPos} RouteLane=({rlStr}) AccessLane=({alStr}) TargetLane=({laneStr}) | Stop=({stopStr}) | Road=({roadStr})";
+        }
+
+        private string FormatStopDiag(Entity stopEntity, PrefabSystem prefabSystem, out Entity roadEntity)
+        {
+            roadEntity = Entity.Null;
+            if (stopEntity == Entity.Null || !EntityManager.Exists(stopEntity))
+                return "none";
+
+            string prefabName = SafePrefabName(prefabSystem, stopEntity);
+            string trStr = EntityManager.HasComponent<Game.Objects.Transform>(stopEntity)
+                ? EntityManager.GetComponentData<Game.Objects.Transform>(stopEntity).m_Position.ToString()
+                : "none";
+
+            string attStr = "detached";
+            if (EntityManager.HasComponent<Attached>(stopEntity))
+            {
+                var att = EntityManager.GetComponentData<Attached>(stopEntity);
+                roadEntity = att.m_Parent;
+                attStr = $"{att.m_Parent}@{att.m_CurvePosition:F3}";
+            }
+
+            string elevStr = "none";
+            if (EntityManager.HasComponent<Game.Objects.Elevation>(stopEntity))
+            {
+                var el = EntityManager.GetComponentData<Game.Objects.Elevation>(stopEntity);
+                elevStr = $"{el.m_Elevation:F2}/{el.m_Flags}";
+            }
+
+            string tsStr = "none";
+            if (EntityManager.HasComponent<Game.Routes.TransportStop>(stopEntity))
+            {
+                var ts = EntityManager.GetComponentData<Game.Routes.TransportStop>(stopEntity);
+                tsStr = $"flags={ts.m_Flags},comfort={ts.m_ComfortFactor:F2},load={ts.m_LoadingFactor:F2}";
+            }
+
+            int subLanes = EntityManager.HasBuffer<Game.Net.SubLane>(stopEntity) ? EntityManager.GetBuffer<Game.Net.SubLane>(stopEntity).Length : -1;
+            int connRoutes = EntityManager.HasBuffer<ConnectedRoute>(stopEntity) ? EntityManager.GetBuffer<ConnectedRoute>(stopEntity).Length : -1;
+
+            string geomStr = "none";
+            if (EntityManager.HasComponent<PrefabRef>(stopEntity))
+            {
+                Entity prefab = EntityManager.GetComponentData<PrefabRef>(stopEntity).m_Prefab;
+                if (prefab != Entity.Null && EntityManager.HasComponent<ObjectGeometryData>(prefab))
+                    geomStr = $"size={EntityManager.GetComponentData<ObjectGeometryData>(prefab).m_Size}";
+            }
+
+            return $"ent={stopEntity},prefab={prefabName},pos={trStr},att={attStr},elev={elevStr},subLanes={subLanes},connRoutes={connRoutes},ts=({tsStr}),geom=({geomStr})";
+        }
+
+        private string FormatRoadDiag(Entity roadEntity, Entity stopEntity, PrefabSystem prefabSystem)
+        {
+            if (roadEntity == Entity.Null || !EntityManager.Exists(roadEntity))
+                return "none";
+
+            string prefabName = SafePrefabName(prefabSystem, roadEntity);
+            string compStr = "none";
+            if (EntityManager.HasComponent<Game.Net.Composition>(roadEntity))
+            {
+                Entity compEdge = EntityManager.GetComponentData<Game.Net.Composition>(roadEntity).m_Edge;
+                float compWidth = EntityManager.HasComponent<NetCompositionData>(compEdge)
+                    ? EntityManager.GetComponentData<NetCompositionData>(compEdge).m_Width
+                    : -1f;
+
+                int buildableAreas = 0;
+                float maxAreaW = 0f;
+                if (EntityManager.HasBuffer<NetCompositionArea>(compEdge))
+                {
+                    var areas = EntityManager.GetBuffer<NetCompositionArea>(compEdge);
+                    for (int i = 0; i < areas.Length; i++)
+                    {
+                        var area = areas[i];
+                        if ((area.m_Flags & NetAreaFlags.Buildable) != 0 && (area.m_Flags & NetAreaFlags.Median) == 0)
+                        {
+                            buildableAreas++;
+                            if (area.m_Width > maxAreaW)
+                                maxAreaW = area.m_Width;
+                        }
+                    }
+                }
+
+                compStr = $"edge={compEdge},w={compWidth:F2},buildAreas={buildableAreas},maxAreaW={maxAreaW:F2}";
+            }
+
+            int subObjCount = EntityManager.HasBuffer<Game.Objects.SubObject>(roadEntity)
+                ? EntityManager.GetBuffer<Game.Objects.SubObject>(roadEntity).Length
+                : -1;
+            bool inSubObj = stopEntity != Entity.Null && IsEntityInSubObjects(roadEntity, stopEntity);
+
+            string elevStr = EntityManager.HasComponent<Game.Net.Elevation>(roadEntity)
+                ? EntityManager.GetComponentData<Game.Net.Elevation>(roadEntity).m_Elevation.ToString()
+                : "none";
+
+            int carLaneCount = 0;
+            int pedLaneCount = 0;
+            if (EntityManager.HasBuffer<Game.Net.SubLane>(roadEntity))
+            {
+                var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(roadEntity);
+                for (int i = 0; i < subLanes.Length; i++)
+                {
+                    Entity lane = subLanes[i].m_SubLane;
+                    if (EntityManager.HasComponent<Game.Net.CarLane>(lane)) carLaneCount++;
+                    if (EntityManager.HasComponent<Game.Net.PedestrianLane>(lane)) pedLaneCount++;
+                }
+            }
+
+            return $"ent={roadEntity},prefab={prefabName},comp=({compStr}),subObjs={subObjCount},inSubObj={inSubObj},elev={elevStr},carLanes={carLaneCount},pedLanes={pedLaneCount}";
+        }
+
+        private string FormatLaneDiag(Entity laneEntity)
+        {
+            if (laneEntity == Entity.Null || !EntityManager.Exists(laneEntity))
+                return "none";
+
+            string carFlags = EntityManager.HasComponent<Game.Net.CarLane>(laneEntity)
+                ? EntityManager.GetComponentData<Game.Net.CarLane>(laneEntity).m_Flags.ToString()
+                : "notCar";
+
+            string roadTypes = "none";
+            if (EntityManager.HasComponent<PrefabRef>(laneEntity))
+            {
+                Entity lanePrefab = EntityManager.GetComponentData<PrefabRef>(laneEntity).m_Prefab;
+                if (lanePrefab != Entity.Null && EntityManager.HasComponent<CarLaneData>(lanePrefab))
+                    roadTypes = EntityManager.GetComponentData<CarLaneData>(lanePrefab).m_RoadTypes.ToString();
+            }
+
+            bool isSlave = EntityManager.HasComponent<Game.Net.SlaveLane>(laneEntity);
+            bool isMaster = EntityManager.HasComponent<Game.Net.MasterLane>(laneEntity);
+            bool isPed = EntityManager.HasComponent<Game.Net.PedestrianLane>(laneEntity);
+
+            return $"ent={laneEntity},car={carFlags},types={roadTypes},slave={isSlave},master={isMaster},ped={isPed}";
+        }
+
+        private void LogPrefabGeometryTable(PrefabSystem prefabSystem)
+        {
+            if (_busStopPrefabQuery.IsEmptyIgnoreFilter)
+                return;
+
+            using var entities = _busStopPrefabQuery.ToEntityArray(Allocator.Temp);
+            using var stopDataArray = _busStopPrefabQuery.ToComponentDataArray<TransportStopData>(Allocator.Temp);
+            for (int i = 0; i < entities.Length; i++)
+            {
+                var sd = stopDataArray[i];
+                if (sd.m_TransportType != TransportType.Bus || !sd.m_PassengerTransport)
+                    continue;
+
+                Entity p = entities[i];
+                string pName = prefabSystem != null ? (prefabSystem.GetPrefabName(p) ?? p.ToString()) : p.ToString();
+                string geomStr = "noGeom";
+                if (EntityManager.HasComponent<ObjectGeometryData>(p))
+                {
+                    var g = EntityManager.GetComponentData<ObjectGeometryData>(p);
+                    geomStr = $"flags={g.m_Flags},size={g.m_Size},legSize={g.m_LegSize},legOff={g.m_LegOffset}";
+                }
+                log.Info($"[BrokenDiag][Prefab] name={pName},sign={IsBusStopSign(p)},{geomStr}");
+            }
+        }
+
+        private string FormatPathNode(Game.Pathfind.PathNode node)
+        {
+            return $"o={node.GetOwnerIndex()}:l={node.GetLaneIndex()}:c={node.GetCurvePos():F2}";
+        }
+
+        private string TryGetPfFlags(Game.Pathfind.NativePathfindData pfData, bool hasPf, Entity lane)
+        {
+            if (!hasPf || lane == Entity.Null)
+                return "na";
+            try
+            {
+                if (pfData.GetEdge(lane, out Game.Pathfind.EdgeID eid))
+                    return pfData.GetFlags(eid).ToString();
+                return "missingInPf";
+            }
+            catch (Exception ex)
+            {
+                return $"err:{ex.GetType().Name}";
+            }
+        }
+
+        private string FormatDetailedLane(Entity lane, Game.Pathfind.NativePathfindData pfData, bool hasPf)
+        {
+            if (lane == Entity.Null || !EntityManager.Exists(lane))
+                return "null";
+
+            string nodesStr = EntityManager.HasComponent<Game.Net.Lane>(lane)
+                ? $"s=({FormatPathNode(EntityManager.GetComponentData<Game.Net.Lane>(lane).m_StartNode)}),m=({FormatPathNode(EntityManager.GetComponentData<Game.Net.Lane>(lane).m_MiddleNode)}),e=({FormatPathNode(EntityManager.GetComponentData<Game.Net.Lane>(lane).m_EndNode)})"
+                : "noLane";
+
+            string edgeDeltaStr = EntityManager.HasComponent<Game.Net.EdgeLane>(lane)
+                ? EntityManager.GetComponentData<Game.Net.EdgeLane>(lane).m_EdgeDelta.ToString()
+                : "noEdgeLane";
+
+            string carStr = "notCar";
+            if (EntityManager.HasComponent<Game.Net.CarLane>(lane))
+            {
+                var cl = EntityManager.GetComponentData<Game.Net.CarLane>(lane);
+                carStr = $"flags={cl.m_Flags},restr={cl.m_AccessRestriction},blk={cl.m_BlockageStart}-{cl.m_BlockageEnd},caut={cl.m_CautionStart}-{cl.m_CautionEnd},cwg={cl.m_CarriagewayGroup},spd={cl.m_SpeedLimit:F1}";
+            }
+
+            string masterStr = "notMaster";
+            if (EntityManager.HasComponent<Game.Net.MasterLane>(lane))
+            {
+                var ml = EntityManager.GetComponentData<Game.Net.MasterLane>(lane);
+                masterStr = $"mFlags={ml.m_Flags},grp={ml.m_Group},idx={ml.m_MinIndex}..{ml.m_MaxIndex}";
+            }
+
+            string maxSizeStr = "none";
+            if (EntityManager.HasComponent<PrefabRef>(lane))
+            {
+                Entity p = EntityManager.GetComponentData<PrefabRef>(lane).m_Prefab;
+                if (p != Entity.Null && EntityManager.HasComponent<CarLaneData>(p))
+                {
+                    var cld = EntityManager.GetComponentData<CarLaneData>(p);
+                    maxSizeStr = $"{cld.m_RoadTypes}/{cld.m_MaxSize}";
+                }
+            }
+
+            string ownerStr = EntityManager.HasComponent<Game.Common.Owner>(lane)
+                ? EntityManager.GetComponentData<Game.Common.Owner>(lane).m_Owner.ToString()
+                : "none";
+
+            string pfFlags = TryGetPfFlags(pfData, hasPf, lane);
+            return $"owner={ownerStr},{nodesStr},ed={edgeDeltaStr},{carStr},{masterStr},type={maxSizeStr},pf=({pfFlags})";
+        }
+
+        private string SummarizeRoadEdge(Entity roadEntity)
+        {
+            if (roadEntity == Entity.Null || !EntityManager.Exists(roadEntity))
+                return "null";
+
+            string edgeStr = "noEdge";
+            if (EntityManager.HasComponent<Game.Net.Edge>(roadEntity))
+            {
+                var e = EntityManager.GetComponentData<Game.Net.Edge>(roadEntity);
+                edgeStr = $"{e.m_Start}->{e.m_End}";
+            }
+
+            string curveStr = "";
+            if (EntityManager.HasComponent<Curve>(roadEntity))
+            {
+                var c = EntityManager.GetComponentData<Curve>(roadEntity);
+                float2 t0 = math.normalizesafe(MathUtils.Tangent(c.m_Bezier, 0f).xz);
+                float2 t1 = math.normalizesafe(MathUtils.Tangent(c.m_Bezier, 1f).xz);
+                curveStr = $",p0={c.m_Bezier.a.xz},p1={c.m_Bezier.d.xz},tan0=({t0.x:F2},{t0.y:F2}),tan1=({t1.x:F2},{t1.y:F2})";
+            }
+
+            return $"edge=({edgeStr}){curveStr}";
+        }
+
+        private void LogLaneConnectivityDiag(string contextLabel, string kind, int sampleNum, Entity wpA, Entity wpB)
+        {
+            Entity laneA = (wpA != Entity.Null && EntityManager.HasComponent<RouteLane>(wpA))
+                ? EntityManager.GetComponentData<RouteLane>(wpA).m_StartLane
+                : Entity.Null;
+            Entity laneB = (wpB != Entity.Null && EntityManager.HasComponent<RouteLane>(wpB))
+                ? EntityManager.GetComponentData<RouteLane>(wpB).m_EndLane
+                : Entity.Null;
+
+            Entity roadA = Entity.Null;
+            if (wpA != Entity.Null && EntityManager.HasComponent<Connected>(wpA))
+            {
+                Entity sA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
+                if (sA != Entity.Null && EntityManager.HasComponent<Attached>(sA))
+                    roadA = EntityManager.GetComponentData<Attached>(sA).m_Parent;
+            }
+
+            Entity roadB = Entity.Null;
+            if (wpB != Entity.Null && EntityManager.HasComponent<Connected>(wpB))
+            {
+                Entity sB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
+                if (sB != Entity.Null && EntityManager.HasComponent<Attached>(sB))
+                    roadB = EntityManager.GetComponentData<Attached>(sB).m_Parent;
+            }
+
+            bool hasPf = false;
+            Game.Pathfind.NativePathfindData pfData = default;
+            try
+            {
+                var pqs = World.GetExistingSystemManaged<Game.Pathfind.PathfindQueueSystem>();
+                if (pqs != null)
+                {
+                    pfData = pqs.GetDataContainer(out Unity.Jobs.JobHandle pfDeps);
+                    pfDeps.Complete();
+                    hasPf = pfData.IsCreated;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   PathfindData unavailable: {ex.Message}");
+            }
+
+            log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   GraphA: {SummarizeRoadEdge(roadA)} | LaneA: {FormatDetailedLane(laneA, pfData, hasPf)}");
+            log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   GraphB: {SummarizeRoadEdge(roadB)} | LaneB: {FormatDetailedLane(laneB, pfData, hasPf)}");
+
+            if (roadA != Entity.Null && laneA != Entity.Null && EntityManager.HasComponent<Game.Net.Edge>(roadA) && EntityManager.HasComponent<Game.Net.Lane>(laneA))
+            {
+                var eA = EntityManager.GetComponentData<Game.Net.Edge>(roadA);
+                var lA = EntityManager.GetComponentData<Game.Net.Lane>(laneA);
+                Entity exitNode = EntityManager.HasComponent<Game.Net.CarLane>(laneA) &&
+                                  (EntityManager.GetComponentData<Game.Net.CarLane>(laneA).m_Flags & Game.Net.CarLaneFlags.Invert) != 0
+                    ? eA.m_Start
+                    : eA.m_End;
+
+                int totalCar = 0;
+                int matchEndNode = 0;
+                int matchStartNode = 0;
+                var matches = new System.Text.StringBuilder();
+                var nonMatches = new System.Text.StringBuilder();
+                int nonMatchCount = 0;
+                if (exitNode != Entity.Null && EntityManager.HasBuffer<Game.Net.SubLane>(exitNode))
+                {
+                    var nodeSubLanes = EntityManager.GetBuffer<Game.Net.SubLane>(exitNode);
+                    for (int i = 0; i < nodeSubLanes.Length; i++)
+                    {
+                        Entity sl = nodeSubLanes[i].m_SubLane;
+                        if (!EntityManager.HasComponent<Game.Net.CarLane>(sl) || !EntityManager.HasComponent<Game.Net.Lane>(sl))
+                            continue;
+                        totalCar++;
+                        var nl = EntityManager.GetComponentData<Game.Net.Lane>(sl);
+                        bool fromEnd = nl.m_StartNode.EqualsIgnoreCurvePos(lA.m_EndNode) || nl.m_EndNode.EqualsIgnoreCurvePos(lA.m_EndNode);
+                        bool fromStart = nl.m_StartNode.EqualsIgnoreCurvePos(lA.m_StartNode) || nl.m_EndNode.EqualsIgnoreCurvePos(lA.m_StartNode);
+                        if (fromEnd) matchEndNode++;
+                        if (fromStart) matchStartNode++;
+                        if (fromEnd)
+                        {
+                            var cl = EntityManager.GetComponentData<Game.Net.CarLane>(sl);
+                            string pf = TryGetPfFlags(pfData, hasPf, sl);
+                            matches.Append($" [{sl} flags={cl.m_Flags} slave={EntityManager.HasComponent<Game.Net.SlaveLane>(sl)} pf=({pf}) s=({FormatPathNode(nl.m_StartNode)})->e=({FormatPathNode(nl.m_EndNode)})]");
+                        }
+                        else if (nonMatchCount < 4)
+                        {
+                            nonMatchCount++;
+                            nonMatches.Append($" [{sl} slave={EntityManager.HasComponent<Game.Net.SlaveLane>(sl)} s=({FormatPathNode(nl.m_StartNode)})->e=({FormatPathNode(nl.m_EndNode)})]");
+                        }
+                    }
+                }
+                string sampleSuffix = matchEndNode > 0 ? matches.ToString() : (nonMatchCount > 0 ? $" sampleNonMatch:{nonMatches}" : "");
+                log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   ExitNode={exitNode} totalCar={totalCar} matchEnd={matchEndNode} matchStart={matchStartNode}{sampleSuffix}");
+            }
+
+            if (laneA != Entity.Null && laneB != Entity.Null)
+            {
+                string bfsRes = TraceLaneGraphBfs(laneA, laneB, pfData, hasPf);
+                log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   LaneBFS: {bfsRes}");
+            }
+        }
+
+        private void AddOwnerAndConnected(Entity entity, List<Entity> list, HashSet<Entity> seen, bool includeNodeConnectedEdges)
+        {
+            if (entity == Entity.Null)
+                return;
+            if (seen.Add(entity))
+                list.Add(entity);
+            if (includeNodeConnectedEdges && EntityManager.HasBuffer<ConnectedEdge>(entity))
+            {
+                var ce = EntityManager.GetBuffer<ConnectedEdge>(entity);
+                for (int i = 0; i < ce.Length; i++)
+                {
+                    Entity edgeEnt = ce[i].m_Edge;
+                    if (edgeEnt != Entity.Null && seen.Add(edgeEnt))
+                        list.Add(edgeEnt);
+                }
+            }
+        }
+
+        private string TraceLaneGraphBfs(Entity startLane, Entity endLane, Game.Pathfind.NativePathfindData pfData, bool hasPf)
+        {
+            var queue = new Queue<(Entity lane, int depth)>();
+            var visited = new HashSet<Entity>();
+            var visitedOrder = new List<Entity>(16);
+            var parent = new Dictionary<Entity, Entity>();
+            queue.Enqueue((startLane, 0));
+            visited.Add(startLane);
+            visitedOrder.Add(startLane);
+
+            int expansions = 0;
+            bool found = false;
+            const int maxExpansions = 1500;
+
+            while (queue.Count > 0 && expansions < maxExpansions)
+            {
+                var (curLane, depth) = queue.Dequeue();
+                expansions++;
+                if (curLane == endLane)
+                {
+                    found = true;
+                    break;
+                }
+                if (depth >= 24)
+                    continue;
+
+                if (!EntityManager.HasComponent<Game.Net.Lane>(curLane) || !EntityManager.HasComponent<Game.Common.Owner>(curLane))
+                    continue;
+
+                var lData = EntityManager.GetComponentData<Game.Net.Lane>(curLane);
+                Entity owner = EntityManager.GetComponentData<Game.Common.Owner>(curLane).m_Owner;
+
+                var searchOwners = new List<Entity>(12);
+                var seenOwners = new HashSet<Entity>();
+                if (EntityManager.HasComponent<Game.Net.Edge>(owner))
+                {
+                    var ed = EntityManager.GetComponentData<Game.Net.Edge>(owner);
+                    AddOwnerAndConnected(owner, searchOwners, seenOwners, false);
+                    AddOwnerAndConnected(ed.m_Start, searchOwners, seenOwners, true);
+                    AddOwnerAndConnected(ed.m_End, searchOwners, seenOwners, true);
+                    if (EntityManager.HasBuffer<ConnectedNode>(owner))
+                    {
+                        var cns = EntityManager.GetBuffer<ConnectedNode>(owner);
+                        for (int c = 0; c < cns.Length; c++)
+                            AddOwnerAndConnected(cns[c].m_Node, searchOwners, seenOwners, true);
+                    }
+                }
+                else if (EntityManager.HasBuffer<ConnectedEdge>(owner))
+                {
+                    AddOwnerAndConnected(owner, searchOwners, seenOwners, true);
+                }
+
+                for (int o = 0; o < searchOwners.Count; o++)
+                {
+                    Entity candOwner = searchOwners[o];
+                    if (!EntityManager.HasBuffer<Game.Net.SubLane>(candOwner))
+                        continue;
+
+                    var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(candOwner);
+                    for (int i = 0; i < subLanes.Length; i++)
+                    {
+                        Entity nextLane = subLanes[i].m_SubLane;
+                        if (visited.Contains(nextLane))
+                            continue;
+                        if (!EntityManager.HasComponent<Game.Net.CarLane>(nextLane) || !EntityManager.HasComponent<Game.Net.Lane>(nextLane))
+                            continue;
+                        if (EntityManager.HasComponent<Game.Net.SlaveLane>(nextLane))
+                            continue;
+
+                        var nl = EntityManager.GetComponentData<Game.Net.Lane>(nextLane);
+                        bool matchesFwd = nl.m_StartNode.EqualsIgnoreCurvePos(lData.m_EndNode);
+                        bool nextTwoway = (EntityManager.GetComponentData<Game.Net.CarLane>(nextLane).m_Flags & Game.Net.CarLaneFlags.Twoway) != 0;
+                        bool matchesBwd = nextTwoway && nl.m_EndNode.EqualsIgnoreCurvePos(lData.m_EndNode);
+                        if (!matchesFwd && !matchesBwd)
+                            continue;
+
+                        if (EntityManager.HasComponent<PrefabRef>(nextLane))
+                        {
+                            Entity lp = EntityManager.GetComponentData<PrefabRef>(nextLane).m_Prefab;
+                            if (lp != Entity.Null && EntityManager.HasComponent<CarLaneData>(lp))
+                            {
+                                if ((EntityManager.GetComponentData<CarLaneData>(lp).m_RoadTypes & Game.Net.RoadTypes.Car) == 0)
+                                    continue;
+                            }
+                        }
+
+                        visited.Add(nextLane);
+                        if (visitedOrder.Count < 12)
+                            visitedOrder.Add(nextLane);
+                        parent[nextLane] = curLane;
+                        queue.Enqueue((nextLane, depth + 1));
+                    }
+                }
+            }
+
+            if (!found)
+            {
+                if (visitedOrder.Count <= 12)
+                {
+                    var trace = new System.Text.StringBuilder();
+                    for (int i = 0; i < visitedOrder.Count; i++)
+                    {
+                        Entity ve = visitedOrder[i];
+                        Entity vo = EntityManager.HasComponent<Game.Common.Owner>(ve) ? EntityManager.GetComponentData<Game.Common.Owner>(ve).m_Owner : Entity.Null;
+                        string edgeInfo = "";
+                        if (vo != Entity.Null && EntityManager.HasComponent<Game.Net.Edge>(vo))
+                        {
+                            var ved = EntityManager.GetComponentData<Game.Net.Edge>(vo);
+                            edgeInfo = $"({ved.m_Start}->{ved.m_End})";
+                        }
+                        var vl = EntityManager.HasComponent<Game.Net.Lane>(ve) ? EntityManager.GetComponentData<Game.Net.Lane>(ve) : default;
+                        trace.Append($" {ve}[o={vo}{edgeInfo} s=({FormatPathNode(vl.m_StartNode)})->e=({FormatPathNode(vl.m_EndNode)})]");
+                    }
+                    return $"NOT_FOUND (visited={visited.Count}, expansions={expansions}) trace:{trace}";
+                }
+                return $"NOT_FOUND (visited={visited.Count}, expansions={expansions})";
+            }
+
+            var path = new List<Entity>();
+            Entity pCur = endLane;
+            while (pCur != Entity.Null)
+            {
+                path.Add(pCur);
+                parent.TryGetValue(pCur, out pCur);
+            }
+            path.Reverse();
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"FOUND hops={path.Count - 1} (visited={visited.Count}):");
+            for (int i = 0; i < path.Count; i++)
+            {
+                Entity le = path[i];
+                var cl = EntityManager.GetComponentData<Game.Net.CarLane>(le);
+                string pf = TryGetPfFlags(pfData, hasPf, le);
+                sb.Append($" {le}[flags={cl.m_Flags},restr={cl.m_AccessRestriction},pf={pf}]");
+                if (i + 1 < path.Count) sb.Append(" ->");
+            }
+            return sb.ToString();
         }
     }
 }

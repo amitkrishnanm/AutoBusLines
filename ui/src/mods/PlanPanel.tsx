@@ -40,6 +40,7 @@ const planJsonBinding = bindValue<string>("autoBusLines", "planJson", "[]");
 const statusMessageBinding = bindValue<string>("autoBusLines", "statusMessage", "");
 const planSeedBinding = bindValue<number>("autoBusLines", "planSeed", 0);
 const lineColorModeBinding = bindValue<string>("autoBusLines", "lineColorMode", "perStation");
+const buildProgressBinding = bindValue<number>("autoBusLines", "buildProgress", 0);
 
 // Settings bindings
 const enablePlanModeBinding = bindValue<boolean>("autoBusLines", "enablePlanMode", true);
@@ -280,6 +281,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
     const statusMessage = useValue(statusMessageBinding);
     const planSeed = useValue(planSeedBinding);
     const lineColorMode = useValue(lineColorModeBinding);
+    const buildProgress = useValue(buildProgressBinding);
 
     // Settings values
     const enablePlanMode = useValue(enablePlanModeBinding);
@@ -1122,7 +1124,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                 </div>
 
                 <div style={{ textAlign: "center", padding: "10rem 0 4rem 0", color: "#718096", fontSize: "11rem", fontWeight: 500 }}>
-                    Auto Bus Lines v2.0.6 · Cities: Skylines II
+                    Auto Bus Lines v2.0.7 · Cities: Skylines II
                 </div>
             </div>
         </Scrollable>
@@ -1133,14 +1135,34 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
             <div className={styles.emptyTitle}>
                 {planStatus === "planning"
                     ? "Analyzing City & Planning Routes..."
+                    : planStatus === "building"
+                    ? "Building Transit Network..."
                     : "No Active Transit Plan"}
             </div>
             <div className={styles.emptyDesc}>
                 {planStatus === "planning"
                     ? "Examining road network corridors, curbside bus stop candidates, and depot loop connections."
+                    : planStatus === "building"
+                    ? (statusMessage || "Staging bus stops and bus lines across frames...")
                     : "Select a district scope and click below to scan roads and preview proposed bus lines before building."}
             </div>
-            {planStatus !== "planning" && (
+            {planStatus === "building" && (
+                <div style={{ width: "100%", maxWidth: "420rem", marginTop: "12rem" }}>
+                    <div className={styles.progressBanner}>
+                        <div className={styles.progressHeader}>
+                            <span className={styles.progressStatusText}>{statusMessage || "Building..."}</span>
+                            <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
+                        </div>
+                        <div className={styles.progressBar}>
+                            <div
+                                className={styles.progressBarFill}
+                                style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+            {planStatus !== "planning" && planStatus !== "building" && (
                 <>
                     <div style={{ width: "100%", maxWidth: "420rem", marginBottom: "8rem" }}>
                         {renderDistrictSelector("Choose a specific district to plan lines for, or plan city-wide")}
@@ -1177,9 +1199,22 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                     </Button>
                 </>
             )}
-            {statusMessage && (
+            {planStatus === "building" ? (
+                <div className={styles.progressBanner}>
+                    <div className={styles.progressHeader}>
+                        <span className={styles.progressStatusText}>{statusMessage || "Building transit network..."}</span>
+                        <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
+                    </div>
+                    <div className={styles.progressBar}>
+                        <div
+                            className={styles.progressBarFill}
+                            style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
+                        />
+                    </div>
+                </div>
+            ) : statusMessage ? (
                 <div className={styles.statusBanner}>{statusMessage}</div>
-            )}
+            ) : null}
         </div>
     );
 
@@ -1255,9 +1290,22 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({ onClose }) => {
                 </Tooltip>
             </div>
 
-            {statusMessage && (
+            {planStatus === "building" ? (
+                <div className={styles.progressBanner}>
+                    <div className={styles.progressHeader}>
+                        <span className={styles.progressStatusText}>{statusMessage || "Building transit network..."}</span>
+                        <span className={styles.progressPercent}>{Math.round(buildProgress * 100)}%</span>
+                    </div>
+                    <div className={styles.progressBar}>
+                        <div
+                            className={styles.progressBarFill}
+                            style={{ width: `${Math.max(2, Math.min(100, Math.round(buildProgress * 100)))}%` }}
+                        />
+                    </div>
+                </div>
+            ) : statusMessage ? (
                 <div className={styles.statusBanner}>{statusMessage}</div>
-            )}
+            ) : null}
 
             {/* Scrollable Routes List */}
             <Scrollable vertical trackVisibility="always" className={styles.scrollable}>

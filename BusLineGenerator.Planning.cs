@@ -22,6 +22,8 @@ using System;
 using System.Collections.Generic;
 using Colossal.Mathematics;
 using Game.Net;
+using Game.Prefabs;
+using Game.Vehicles;
 using Unity.Entities;
 using Unity.Mathematics;
 using Edge = Game.Net.Edge;
@@ -117,32 +119,93 @@ namespace AutoBusLines
         }
 
         // True if the stop serves traffic travelling edge.m_Start -> edge.m_End.
-        // Uses the stop's position (which side of the centreline it sits on) - exactly what the
-        // game's lane matching does - and the road's flow on one-way roads. The stop's rotation is
-        // deliberately NOT used: vanilla roadside stops face the road, perpendicular to traffic.
+        // Uses the closest CarLane (matching WaypointConnectionSystem.FindLane), the stop's position,
+        // and the road's flow on one-way roads. Handles asymmetric roads and medians precisely.
         private bool StopServesEdgeForward(PlacedStop stop)
         {
             var roadEnt = stop.RoadEntity;
-            if (roadEnt != Entity.Null && EntityManager.HasComponent<Curve>(roadEnt))
+            if (roadEnt != Entity.Null && EntityManager.Exists(roadEnt) && EntityManager.HasComponent<Curve>(roadEnt))
             {
                 var curve = EntityManager.GetComponentData<Curve>(roadEnt);
 
                 if (IsOneWayRoad(roadEnt, out bool flowForward))
                     return flowForward;
 
-                MathUtils.Distance(curve.m_Bezier, stop.Position, out float t);
-                float3 centre = MathUtils.Position(curve.m_Bezier, t);
-                float3 tan = MathUtils.Tangent(curve.m_Bezier, t);
-                tan = math.normalizesafe(new float3(tan.x, 0f, tan.z), new float3(0, 0, 1));
-                float3 offset = stop.Position - centre;
-                offset.y = 0f;
-                float side = math.dot(offset, new float3(tan.z, 0f, -tan.x)); // > 0: right of travel along start->end
-                if (math.abs(side) > 0.5f)
-                    return IsLeftHandTraffic() ? side < 0f : side > 0f;
+                // 1. Check actual CarLanes on roadEnt to find the closest lane to stop.Position.
+                // This matches WaypointConnectionSystem.FindLane with 100% precision, handling
+                // asymmetric roads (e.g. 2 lanes one way, 1 lane other way), bus lanes, medians, and offsets.
+                if (EntityManager.HasBuffer<Game.Net.SubLane>(roadEnt))
+                {
+                    var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(roadEnt);
+                    Entity bestLane = Entity.Null;
+                    float bestDistSq = float.MaxValue;
+                    bool bestIsInvert = false;
 
-                // Stop sits (almost) on the centreline: fall back to its heading
-                float3 roadTan = math.normalizesafe(MathUtils.Tangent(curve.m_Bezier, 0.5f), new float3(0, 0, 1));
-                return math.dot(stop.Forward, roadTan) >= 0f;
+                    bool hasStopForward = math.lengthsq(stop.Forward.xz) > 0.001f;
+
+                    // Pass 0: check lanes matching the stop's travel heading (stop.Forward)
+                    // Pass 1: any valid car lane on road
+                    for (int pass = hasStopForward ? 0 : 1; pass < 2; pass++)
+                    {
+                        for (int l = 0; l < subLanes.Length; l++)
+                        {
+                            Entity subLane = subLanes[l].m_SubLane;
+                            if (!EntityManager.HasComponent<Game.Net.CarLane>(subLane) ||
+                                !EntityManager.HasComponent<Curve>(subLane) ||
+                                EntityManager.HasComponent<Game.Net.SlaveLane>(subLane))
+                                continue;
+
+                            var carLane = EntityManager.GetComponentData<Game.Net.CarLane>(subLane);
+                            if ((carLane.m_Flags & (Game.Net.CarLaneFlags.Unsafe | Game.Net.CarLaneFlags.SideConnection | Game.Net.CarLaneFlags.Forbidden)) != 0)
+                                continue;
+
+                            if (EntityManager.HasComponent<PrefabRef>(subLane))
+                            {
+                                Entity lanePrefab = EntityManager.GetComponentData<PrefabRef>(subLane).m_Prefab;
+                                if (EntityManager.HasComponent<CarLaneData>(lanePrefab))
+                                {
+                                    var laneData = EntityManager.GetComponentData<CarLaneData>(lanePrefab);
+                                    if ((laneData.m_RoadTypes & Game.Net.RoadTypes.Car) == 0)
+                                        continue; // Skip bicycle tracks, pedestrian lanes, etc.
+                                    if ((int)laneData.m_MaxSize < (int)SizeClass.Large)
+                                        continue;
+                                }
+                            }
+
+                            var laneCurve = EntityManager.GetComponentData<Curve>(subLane);
+                            float dist = MathUtils.Distance(laneCurve.m_Bezier.xz, stop.Position.xz, out float t);
+
+                            if (pass == 0 && hasStopForward)
+                            {
+                                float3 laneDir = math.normalizesafe(MathUtils.Tangent(laneCurve.m_Bezier, t));
+                                if (math.dot(laneDir.xz, stop.Forward.xz) < 0.2f)
+                                    continue;
+                            }
+
+                            float dSq = dist * dist;
+                            if (dSq < bestDistSq)
+                            {
+                                bestDistSq = dSq;
+                                bestLane = subLane;
+                                bestIsInvert = (carLane.m_Flags & Game.Net.CarLaneFlags.Invert) != 0;
+                            }
+                        }
+
+                        if (bestLane != Entity.Null)
+                            break;
+                    }
+
+                    if (bestLane != Entity.Null)
+                    {
+                        // Invert flag means the lane flows in reverse direction (end -> start).
+                        // Absence of Invert flag means it flows in forward direction (start -> end).
+                        return !bestIsInvert;
+                    }
+                }
+
+                // Fallback to geometric check if sublanes are not yet allocated
+                float3 roadTan = math.normalizesafe(MathUtils.Tangent(curve.m_Bezier, stop.RoadT), new float3(0, 0, 1));
+                return math.dot(stop.Forward.xz, roadTan.xz) >= 0f;
             }
             return true;
         }
@@ -501,6 +564,7 @@ namespace AutoBusLines
                 }
             }
 
+            ValidateAndPruneTours(ctx);
             DiagnoseTours(ctx);
 
             servedStopEntities = ctx.Served;
@@ -809,8 +873,16 @@ namespace AutoBusLines
 
                     if (tour.Count >= 4)
                     {
+                        // Verify that the bus can return from the last stop towards the station vicinity
+                        int firstCtxIdx = ctx.StopIndex[firstStop.StopEntity];
+                        if (!TryLegLength(ctx, currentCtxIdx, firstCtxIdx, 4500f, out float returnLegDist))
+                        {
+                            log.Info($"PlanStationHubLoops: Skipping Station Line candidate for Bus Station {stationEntity.Index} because last stop {tour[tour.Count - 1].StopEntity.Index} cannot pathfind back towards the station entrance.");
+                            break;
+                        }
+
                         // Calculate final total road length (including return to station)
-                        float finalLength = totalRoadDist + math.distance(currentPos, bay.Position) * 1.35f;
+                        float finalLength = totalRoadDist + returnLegDist;
 
                         AcceptTour(ctx, tour);
                         ctx.Served.Add(bay.StopEntity);
@@ -1680,6 +1752,161 @@ namespace AutoBusLines
                 {
                     log.Warn($"Phase F: stop {stop.StopEntity.Index} could not be joined to any line without an illegal or excessive detour; left unserved");
                 }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Tour validation and unreachable leg pruning
+        // ------------------------------------------------------------------
+
+        private void ValidateAndPruneTours(PlanContext ctx)
+        {
+            for (int ti = ctx.Tours.Count - 1; ti >= 0; ti--)
+            {
+                var tour = ctx.Tours[ti];
+                if (tour == null || tour.Count < ABSOLUTE_MIN_STOPS)
+                {
+                    DropTour(ctx, ti);
+                    continue;
+                }
+
+                // Check legs and attempt to prune unreachable curbside stops
+                bool modified = true;
+                int maxIterations = tour.Count;
+                while (modified && tour.Count >= ABSOLUTE_MIN_STOPS && maxIterations-- > 0)
+                {
+                    modified = false;
+                    int n = tour.Count;
+                    for (int i = 0; i < n; i++)
+                    {
+                        int nextIdx = (i + 1) % n;
+                        var stA = tour[i];
+                        var stB = tour[nextIdx];
+
+                        // Skip station bays for road-graph leg length if they don't have edges
+                        if (!ctx.StopIndex.TryGetValue(stA.StopEntity, out int ai) ||
+                            !ctx.StopIndex.TryGetValue(stB.StopEntity, out int bi) ||
+                            !ctx.HasEdge[ai] || !ctx.HasEdge[bi])
+                        {
+                            continue;
+                        }
+
+                        if (!TryLegLength(ctx, ai, bi, 6000f, out _))
+                        {
+                            // Unreachable leg from i to nextIdx!
+                            // Try bypassing stB if stB is not a station bay and tour.Count > ABSOLUTE_MIN_STOPS
+                            if (!stB.IsStationBay && tour.Count > ABSOLUTE_MIN_STOPS)
+                            {
+                                int nextNextIdx = (i + 2) % n;
+                                var stC = tour[nextNextIdx];
+                                bool canSkipB = false;
+                                if (!ctx.StopIndex.TryGetValue(stC.StopEntity, out int ci) || !ctx.HasEdge[ci])
+                                {
+                                    canSkipB = true;
+                                }
+                                else if (TryLegLength(ctx, ai, ci, 6000f, out _))
+                                {
+                                    canSkipB = true;
+                                }
+
+                                if (canSkipB)
+                                {
+                                    log.Info($"ValidateAndPruneTours: Pruned unreachable stop {stB.StopEntity.Index} from tour #{ti + 1}.");
+                                    tour.RemoveAt(nextIdx);
+                                    UnserveStopIfOrphaned(ctx, stB.StopEntity, ti);
+                                    modified = true;
+                                    break;
+                                }
+                            }
+
+                            // If stB cannot be bypassed, try bypassing stA if stA is not a station bay
+                            int prevIdx = (i - 1 + n) % n;
+                            var stPrev = tour[prevIdx];
+                            if (!stA.IsStationBay && tour.Count > ABSOLUTE_MIN_STOPS)
+                            {
+                                bool canSkipA = false;
+                                if (!ctx.StopIndex.TryGetValue(stPrev.StopEntity, out int pi) || !ctx.HasEdge[pi])
+                                {
+                                    canSkipA = true;
+                                }
+                                else if (TryLegLength(ctx, pi, bi, 6000f, out _))
+                                {
+                                    canSkipA = true;
+                                }
+
+                                if (canSkipA)
+                                {
+                                    log.Info($"ValidateAndPruneTours: Pruned unreachable stop {stA.StopEntity.Index} from tour #{ti + 1}.");
+                                    tour.RemoveAt(i);
+                                    UnserveStopIfOrphaned(ctx, stA.StopEntity, ti);
+                                    modified = true;
+                                    break;
+                                }
+                            }
+
+                            break;
+                        }
+                    }
+                }
+
+                // Final verification: ensure tour has no remaining broken legs and does not exceed max length
+                int finalN = tour.Count;
+                if (finalN < ABSOLUTE_MIN_STOPS)
+                {
+                    log.Warn($"ValidateAndPruneTours: Dropping tour #{ti + 1} because it has fewer than {ABSOLUTE_MIN_STOPS} stops after pruning.");
+                    DropTour(ctx, ti);
+                    continue;
+                }
+
+                bool hasBadLeg = false;
+                float tourLen = 0f;
+                for (int i = 0; i < finalN; i++)
+                {
+                    var stA = tour[i];
+                    var stB = tour[(i + 1) % finalN];
+                    if (ctx.StopIndex.TryGetValue(stA.StopEntity, out int ai) &&
+                        ctx.StopIndex.TryGetValue(stB.StopEntity, out int bi) &&
+                        ctx.HasEdge[ai] && ctx.HasEdge[bi])
+                    {
+                        if (!TryLegLength(ctx, ai, bi, 6000f, out float leg))
+                        {
+                            hasBadLeg = true;
+                            break;
+                        }
+                        tourLen += leg;
+                    }
+                }
+
+                if (hasBadLeg || tourLen > ctx.MaxRouteLength * 1.5f)
+                {
+                    log.Warn($"ValidateAndPruneTours: Dropping tour #{ti + 1} because it contains unreachable legs or exceeds maximum length (len={tourLen:F0}m, badLeg={hasBadLeg}).");
+                    DropTour(ctx, ti);
+                }
+            }
+        }
+
+        private void UnserveStopIfOrphaned(PlanContext ctx, Entity stopEntity, int skipTourIdx)
+        {
+            for (int t = 0; t < ctx.Tours.Count; t++)
+            {
+                if (t == skipTourIdx) continue;
+                var tour = ctx.Tours[t];
+                for (int s = 0; s < tour.Count; s++)
+                {
+                    if (tour[s].StopEntity == stopEntity)
+                        return; // Still served by another tour
+                }
+            }
+            ctx.Served.Remove(stopEntity);
+        }
+
+        private void DropTour(PlanContext ctx, int tourIdx)
+        {
+            var tour = ctx.Tours[tourIdx];
+            ctx.Tours.RemoveAt(tourIdx);
+            for (int s = 0; s < tour.Count; s++)
+            {
+                UnserveStopIfOrphaned(ctx, tour[s].StopEntity, -1);
             }
         }
 

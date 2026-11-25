@@ -24,6 +24,7 @@ namespace AutoBusLines
         private ValueBinding<string> m_StatusMessage;
         private ValueBinding<int> m_PlanSeed;
         private ValueBinding<string> m_LineColorMode;
+        private ValueBinding<float> m_BuildProgress;
 
         // District & Stops-only bindings
         private EntityQuery m_DistrictQuery;
@@ -56,6 +57,7 @@ namespace AutoBusLines
             AddBinding(m_StatusMessage = new ValueBinding<string>(kGroup, "statusMessage", ""));
             AddBinding(m_PlanSeed = new ValueBinding<int>(kGroup, "planSeed", 0));
             AddBinding(m_LineColorMode = new ValueBinding<string>(kGroup, "lineColorMode", Mod.setting?.LineColoring == LineColorMode.Random ? "random" : "perStation"));
+            AddBinding(m_BuildProgress = new ValueBinding<float>(kGroup, "buildProgress", 0f));
 
             // Settings bindings
             var s = Mod.setting;
@@ -172,6 +174,19 @@ namespace AutoBusLines
             if (message != null)
             {
                 m_StatusMessage.Update(message);
+            }
+        }
+
+        public void SetBuildProgress(float progress, string status = null, string message = null)
+        {
+            m_BuildProgress?.Update(math.clamp(progress, 0f, 1f));
+            if (!string.IsNullOrEmpty(status))
+            {
+                m_PlanStatus?.Update(status);
+            }
+            if (message != null)
+            {
+                m_StatusMessage?.Update(message);
             }
         }
 
