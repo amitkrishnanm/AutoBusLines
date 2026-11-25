@@ -72,7 +72,7 @@ namespace AutoBusLines
             AddBinding(m_TargetStopSpacing = new ValueBinding<int>(kGroup, "targetStopSpacing", s?.TargetStopSpacing ?? 200));
             AddBinding(m_SelectedStopPrefab = new ValueBinding<string>(kGroup, "selectedStopPrefab", s?.SelectedStopPrefab ?? "All"));
             AddBinding(m_StopPrefabOptions = new ValueBinding<string>(kGroup, "stopPrefabOptions", "[]"));
-            AddBinding(m_ModVersion = new ValueBinding<string>(kGroup, "modVersion", s?.ModVersion ?? "2.1.0"));
+            AddBinding(m_ModVersion = new ValueBinding<string>(kGroup, "modVersion", s?.ModVersion ?? "2.1.0-hotfix"));
 
             AddBinding(new TriggerBinding(kGroup, "togglePanel", OnTogglePanel));
             AddBinding(new TriggerBinding(kGroup, "openPanel", OnOpenPanel));

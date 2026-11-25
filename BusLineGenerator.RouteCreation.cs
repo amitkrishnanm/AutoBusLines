@@ -489,6 +489,7 @@ namespace AutoBusLines
             );
             int stopCount = 0;
 
+            var affectedRoads = new HashSet<Entity>();
             using (var stops = stopQuery.ToEntityArray(Allocator.Temp))
             {
                 for (int i = 0; i < stops.Length; i++)
@@ -554,7 +555,7 @@ namespace AutoBusLines
                                                 subObjects.RemoveAt(s);
                                             }
                                         }
-                                        MarkRoadUpdatedWithNodes(roadOwner);
+                                        affectedRoads.Add(roadOwner);
                                     }
                                     ClearRoadDeadEndNotifications(roadOwner);
                                 }
@@ -565,6 +566,9 @@ namespace AutoBusLines
                     }
                 }
             }
+
+            if (affectedRoads.Count > 0)
+                MarkRoadsUpdatedWithNodes(affectedRoads);
 
             // 5. Reset system state for regeneration
             _hasRun = false;
@@ -760,7 +764,8 @@ namespace AutoBusLines
                                     if (EntityManager.HasComponent<Connected>(wpA))
                                     {
                                         var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
-                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA))
+                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA) &&
+                                            ShouldNudgeStopForWaypoint(wpA, stopA))
                                         {
                                             stopsToNudge.Add(stopA);
                                         }
@@ -781,7 +786,8 @@ namespace AutoBusLines
                                     if (EntityManager.HasComponent<Connected>(wpB))
                                     {
                                         var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
-                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB))
+                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB) &&
+                                            ShouldNudgeStopForWaypoint(wpB, stopB))
                                         {
                                             stopsToNudge.Add(stopB);
                                         }
@@ -822,14 +828,19 @@ namespace AutoBusLines
 
             LogBrokenSegmentDiagnostics(scannedBusRoutes, "ManualRepair");
 
-            // 1. Nudge problematic roadside bus stops along their road curves
+            // 1. Nudge problematic roadside bus stops along their road curves and batch road updates
+            var nudgedRoads = new HashSet<Entity>();
             foreach (var stopEntity in stopsToNudge)
             {
-                if (NudgeRoadsideBusStop(stopEntity))
+                if (NudgeRoadsideBusStop(stopEntity, out Entity nudgedRoad, markRoadUpdated: false))
                 {
                     stopsNudged++;
+                    if (nudgedRoad != Entity.Null)
+                        nudgedRoads.Add(nudgedRoad);
                 }
             }
+            if (nudgedRoads.Count > 0)
+                MarkRoadsUpdatedWithNodes(nudgedRoads);
 
             // 2. Reset PathTargets and PathInformation on affected segments to force RoutePathSystem to recalculate
             foreach (var segEnt in segmentsToReset)
@@ -877,8 +888,40 @@ namespace AutoBusLines
 
         }
 
+        /// <summary>
+        /// Returns true only when the waypoint failed to bind to a valid road CarLane
+        /// owned by the stop's attached road segment (e.g. null lane, Area ConnectionLane,
+        /// or mismatched owner), avoiding unnecessary road rebuilds on healthy stops.
+        /// </summary>
+        private bool ShouldNudgeStopForWaypoint(Entity wpEntity, Entity stopEntity)
+        {
+            if (!EntityManager.Exists(wpEntity) || !EntityManager.HasComponent<RouteLane>(wpEntity))
+                return true;
+
+            var rl = EntityManager.GetComponentData<RouteLane>(wpEntity);
+            if (rl.m_EndLane == Entity.Null || !EntityManager.Exists(rl.m_EndLane) ||
+                !EntityManager.HasComponent<Game.Net.CarLane>(rl.m_EndLane))
+                return true;
+
+            if (stopEntity != Entity.Null && EntityManager.HasComponent<Attached>(stopEntity))
+            {
+                Entity roadEntity = EntityManager.GetComponentData<Attached>(stopEntity).m_Parent;
+                if (roadEntity != Entity.Null && EntityManager.HasComponent<Owner>(rl.m_EndLane) &&
+                    EntityManager.GetComponentData<Owner>(rl.m_EndLane).m_Owner != roadEntity)
+                    return true;
+            }
+
+            return false;
+        }
+
         private bool NudgeRoadsideBusStop(Entity stopEntity)
         {
+            return NudgeRoadsideBusStop(stopEntity, out _, markRoadUpdated: true);
+        }
+
+        private bool NudgeRoadsideBusStop(Entity stopEntity, out Entity nudgedRoad, bool markRoadUpdated)
+        {
+            nudgedRoad = Entity.Null;
             if (!EntityManager.Exists(stopEntity) || EntityManager.HasComponent<Deleted>(stopEntity))
                 return false;
 
@@ -976,14 +1019,15 @@ namespace AutoBusLines
                 ? EntityManager.GetComponentData<PrefabRef>(stopEntity).m_Prefab
                 : Entity.Null;
             bool isRightSide = sideDot >= 0f;
-            float finalAttachedT = newT;
-            if (TrySnapToRoadCurbArea(roadEntity, newT, newRoadPos, normal, isRightSide, stopPrefabEntity,
+            if (!TrySnapToRoadCurbAreaWithShift(roadEntity, newT, newRoadPos, normal, isRightSide, stopPrefabEntity,
                     out float3 areaPos, out quaternion areaRot, out float areaT, out _))
             {
-                newStopPos = areaPos;
-                newRot = areaRot;
-                finalAttachedT = areaT;
+                return false;
             }
+
+            newStopPos = areaPos;
+            newRot = areaRot;
+            float finalAttachedT = areaT;
 
             SyncStopElevationWithRoad(stopEntity, roadEntity);
 
@@ -1019,7 +1063,10 @@ namespace AutoBusLines
                 var roadSubObjects = EntityManager.AddBuffer<Game.Objects.SubObject>(roadEntity);
                 roadSubObjects.Add(new Game.Objects.SubObject(stopEntity));
             }
-            MarkRoadUpdatedWithNodes(roadEntity);
+            if (markRoadUpdated)
+                MarkRoadUpdatedWithNodes(roadEntity);
+            else
+                nudgedRoad = roadEntity;
 
             // Clean up any legacy DeadEnd warnings on parent road
             ClearRoadDeadEndNotifications(roadEntity);
@@ -1047,46 +1094,124 @@ namespace AutoBusLines
         }
 
         /// <summary>
-        /// Marks a road edge and its endpoint/middle-connected nodes Updated together so CS2's
-        /// LaneSystem and LaneReferencesSystem preserve skipped pass-through lane stitching across
-        /// adjacent edges, and strips any lingering SubObjectsUpdated component from the road entity
-        /// (which CleanUpSystem never removes and which belongs only on transient Event entities).
+        /// Marks the road edge, its direct endpoint/connected nodes, all adjacent neighbor edges meeting
+        /// at those nodes, and those neighbor edges' far endpoint/connected nodes as Updated (plus
+        /// BatchesUpdated on primary roads, direct nodes, and neighbor edges).
+        /// Updating direct nodes + neighbor edges prevents GeometrySystem.InitializeNodeGeometryJob partial
+        /// clamping (m_Bounds.min.x = 1f -> intersection seams), while updating farNodes ensures
+        /// LaneOverlapSystem rebuilds far-end NodeLane.LaneOverlap buffers alongside neighbor edge SubLanes
+        /// so CarLaneSpeedIterator.CheckOverlappingLanes never reads deleted SubLane entities.
         /// </summary>
         private void MarkRoadUpdatedWithNodes(Entity roadEntity)
         {
             if (roadEntity == Entity.Null || !EntityManager.Exists(roadEntity) || EntityManager.HasComponent<Deleted>(roadEntity))
                 return;
 
-            if (EntityManager.HasComponent<Game.Objects.SubObjectsUpdated>(roadEntity))
-                EntityManager.RemoveComponent<Game.Objects.SubObjectsUpdated>(roadEntity);
+            MarkRoadsUpdatedWithNodes(new[] { roadEntity });
+        }
 
-            if (!EntityManager.HasComponent<Updated>(roadEntity))
-                EntityManager.AddComponentData(roadEntity, default(Updated));
+        /// <summary>
+        /// Marks a batch of modified road edges together with their full 1-hop node-edge-node closure
+        /// (primaryRoads + directNodes + neighborEdges + farNodes) so GeometrySystem, LaneSystem,
+        /// LaneOverlapSystem, and WaypointConnectionSystem all see consistent boundaries.
+        /// </summary>
+        private void MarkRoadsUpdatedWithNodes(IEnumerable<Entity> roadEntities)
+        {
+            if (roadEntities == null)
+                return;
 
-            if (EntityManager.HasComponent<Game.Net.Edge>(roadEntity))
+            var primaryRoads = new HashSet<Entity>();
+            foreach (var r in roadEntities)
+                CollectValidEntity(r, primaryRoads);
+
+            if (primaryRoads.Count == 0)
+                return;
+
+            var directNodes = new HashSet<Entity>();
+            var neighborEdges = new HashSet<Entity>();
+            var farNodes = new HashSet<Entity>();
+
+            foreach (var roadEntity in primaryRoads)
+                CollectEdgeNodes(roadEntity, directNodes);
+
+            foreach (var node in directNodes)
             {
-                var edge = EntityManager.GetComponentData<Game.Net.Edge>(roadEntity);
-                MarkEntityUpdatedIfValid(edge.m_Start);
-                MarkEntityUpdatedIfValid(edge.m_End);
+                if (!EntityManager.HasBuffer<Game.Net.ConnectedEdge>(node))
+                    continue;
+
+                var connectedEdges = EntityManager.GetBuffer<Game.Net.ConnectedEdge>(node);
+                for (int i = 0; i < connectedEdges.Length; i++)
+                {
+                    Entity adjEdge = connectedEdges[i].m_Edge;
+                    if (!primaryRoads.Contains(adjEdge))
+                        CollectValidEntity(adjEdge, neighborEdges);
+                }
             }
 
-            if (EntityManager.HasBuffer<Game.Net.ConnectedNode>(roadEntity))
+            foreach (var adjEdge in neighborEdges)
+                CollectEdgeNodes(adjEdge, farNodes, excludeNodes: directNodes);
+
+            // Apply structural ECS tag changes only after all DynamicBuffer reads finish.
+            foreach (var roadEntity in primaryRoads)
             {
-                var connectedNodes = EntityManager.GetBuffer<Game.Net.ConnectedNode>(roadEntity);
+                if (EntityManager.HasComponent<Game.Objects.SubObjectsUpdated>(roadEntity))
+                    EntityManager.RemoveComponent<Game.Objects.SubObjectsUpdated>(roadEntity);
+
+                MarkEntityUpdatedIfValid(roadEntity, includeBatches: true);
+            }
+
+            foreach (var node in directNodes)
+                MarkEntityUpdatedIfValid(node, includeBatches: true);
+
+            foreach (var adjEdge in neighborEdges)
+                MarkEntityUpdatedIfValid(adjEdge, includeBatches: true);
+
+            foreach (var farNode in farNodes)
+                MarkEntityUpdatedIfValid(farNode, includeBatches: false);
+        }
+
+        private void CollectEdgeNodes(Entity edgeEntity, HashSet<Entity> targetNodes, HashSet<Entity> excludeNodes = null)
+        {
+            if (EntityManager.HasComponent<Game.Net.Edge>(edgeEntity))
+            {
+                var edge = EntityManager.GetComponentData<Game.Net.Edge>(edgeEntity);
+                if (excludeNodes == null || !excludeNodes.Contains(edge.m_Start))
+                    CollectValidEntity(edge.m_Start, targetNodes);
+                if (excludeNodes == null || !excludeNodes.Contains(edge.m_End))
+                    CollectValidEntity(edge.m_End, targetNodes);
+            }
+
+            if (EntityManager.HasBuffer<Game.Net.ConnectedNode>(edgeEntity))
+            {
+                var connectedNodes = EntityManager.GetBuffer<Game.Net.ConnectedNode>(edgeEntity);
                 for (int i = 0; i < connectedNodes.Length; i++)
                 {
-                    MarkEntityUpdatedIfValid(connectedNodes[i].m_Node);
+                    Entity midNode = connectedNodes[i].m_Node;
+                    if (excludeNodes == null || !excludeNodes.Contains(midNode))
+                        CollectValidEntity(midNode, targetNodes);
                 }
             }
         }
 
-        private void MarkEntityUpdatedIfValid(Entity entity)
+        private bool CollectValidEntity(Entity entity, HashSet<Entity> target)
         {
-            if (entity != Entity.Null && EntityManager.Exists(entity) && !EntityManager.HasComponent<Deleted>(entity) &&
-                !EntityManager.HasComponent<Updated>(entity))
-            {
+            if (entity == Entity.Null || !EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity))
+                return false;
+
+            target.Add(entity);
+            return true;
+        }
+
+        private void MarkEntityUpdatedIfValid(Entity entity, bool includeBatches = false)
+        {
+            if (entity == Entity.Null || !EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity))
+                return;
+
+            if (!EntityManager.HasComponent<Updated>(entity))
                 EntityManager.AddComponentData(entity, default(Updated));
-            }
+
+            if (includeBatches && !EntityManager.HasComponent<BatchesUpdated>(entity))
+                EntityManager.AddComponentData(entity, default(BatchesUpdated));
         }
 
         private bool NudgeCurbsideWaypoint(Entity wpEntity)
@@ -2005,12 +2130,27 @@ namespace AutoBusLines
                             signPrefab = prefabs[0];
                     }
 
-                    if (signPrefab != Entity.Null && TryCreateBusStopEntity(stop.RoadEntity, stop.RoadT, stop.Position, stop.Forward, stop.HubEntity, stop.CorridorIndex, stop.SpanOrderInCorridor, stop.IsOutbound, signPrefab, out PlacedStop createdStop))
+                    if (signPrefab != Entity.Null && EntityManager.HasComponent<Curve>(stop.RoadEntity))
                     {
-                        stop.StopEntity = createdStop.StopEntity;
-                        stop.PrefabEntity = signPrefab;
-                        uniqueStops[i] = stop;
-                        hasPhysicalStop = true;
+                        var fallbackCurve = EntityManager.GetComponentData<Curve>(stop.RoadEntity);
+                        float3 roadCenterPos = MathUtils.Position(fallbackCurve.m_Bezier, stop.RoadT);
+                        float3 approxCurbNormal = math.normalizesafe(new float3(stop.Position.x - roadCenterPos.x, 0f, stop.Position.z - roadCenterPos.z));
+                        bool isRightSide = math.dot(math.cross(new float3(0f, 1f, 0f), stop.Forward), approxCurbNormal) >= 0f;
+
+                        if (TrySnapToRoadCurbAreaWithShift(
+                                stop.RoadEntity, stop.RoadT, roadCenterPos, approxCurbNormal, isRightSide, signPrefab,
+                                out float3 snappedFallbackPos, out quaternion snappedFallbackRot, out float snappedFallbackT, out _)
+                            && TryCreateBusStopEntity(
+                                stop.RoadEntity, snappedFallbackT, snappedFallbackPos, stop.Forward, stop.HubEntity,
+                                stop.CorridorIndex, stop.SpanOrderInCorridor, stop.IsOutbound, signPrefab, out PlacedStop createdStop, snappedFallbackRot))
+                        {
+                            stop.StopEntity = createdStop.StopEntity;
+                            stop.PrefabEntity = signPrefab;
+                            stop.Position = snappedFallbackPos;
+                            stop.RoadT = snappedFallbackT;
+                            uniqueStops[i] = stop;
+                            hasPhysicalStop = true;
+                        }
                     }
                 }
 

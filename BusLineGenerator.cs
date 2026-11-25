@@ -1,4 +1,4 @@
-// AutoBusLines v2.1.0 - Modular transit planning and generation system
+// AutoBusLines v2.1.0-hotfix - Modular transit planning and generation system
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -657,11 +657,18 @@ namespace AutoBusLines
                 return;
             }
 
-            // Stage 1.5: Incrementally instantiate virtual stops one-by-one across simulation frames
+            // Stage 1.5: Incrementally instantiate virtual stops across simulation frames
             if (_generationStage == GenerationStage.InstantiatingStops)
             {
+                if (_currentVirtualStopIndex == 0 && _pendingVirtualStops != null && _pendingVirtualStops.Count > 1)
+                {
+                    GroupPendingStopsByRoad(_pendingVirtualStops);
+                }
+
                 int stopsProcessed = 0;
-                while (_pendingVirtualStops != null && _currentVirtualStopIndex < _pendingVirtualStops.Count && stopsProcessed < 2)
+                var batchUpdatedRoads = new HashSet<Entity>();
+                while (_pendingVirtualStops != null && _currentVirtualStopIndex < _pendingVirtualStops.Count &&
+                       (stopsProcessed < 16 || (batchUpdatedRoads.Contains(_pendingVirtualStops[_currentVirtualStopIndex].RoadEntity) && stopsProcessed < 32)))
                 {
                     var st = _pendingVirtualStops[_currentVirtualStopIndex];
                     _currentVirtualStopIndex++;
@@ -672,12 +679,17 @@ namespace AutoBusLines
                         if (TryCreateBusStopEntity(st.RoadEntity, st.RoadT, st.Position, st.Forward, st.HubEntity,
                                                    st.CorridorIndex, st.SpanOrderInCorridor, st.IsOutbound,
                                                    st.PrefabEntity, out PlacedStop realPlacedStop,
-                                                   st.HasRotationOverride ? st.RotationOverride : (quaternion?)null))
+                                                   st.HasRotationOverride ? st.RotationOverride : (quaternion?)null,
+                                                   markRoadUpdated: false))
                         {
                             _virtualToRealEntityMap[st.StopEntity.Index] = realPlacedStop.StopEntity;
+                            batchUpdatedRoads.Add(st.RoadEntity);
                         }
                     }
                 }
+
+                if (batchUpdatedRoads.Count > 0)
+                    MarkRoadsUpdatedWithNodes(batchUpdatedRoads);
 
                 float stopProgress = (float)_currentVirtualStopIndex / math.max(1, _totalVirtualStopsToCreate);
                 float overallProgress = stopProgress * 0.60f;
@@ -896,7 +908,8 @@ namespace AutoBusLines
                                     if (EntityManager.HasComponent<Connected>(wpA))
                                     {
                                         var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
-                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA))
+                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA) &&
+                                            ShouldNudgeStopForWaypoint(wpA, stopA))
                                         {
                                             stopsToNudge.Add(stopA);
                                         }
@@ -919,7 +932,8 @@ namespace AutoBusLines
                                     if (EntityManager.HasComponent<Connected>(wpB))
                                     {
                                         var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
-                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB))
+                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB) &&
+                                            ShouldNudgeStopForWaypoint(wpB, stopB))
                                         {
                                             stopsToNudge.Add(stopB);
                                         }
@@ -951,13 +965,18 @@ namespace AutoBusLines
                 {
                     log.Info($"SettlingRoutes Pass {_settlingPass}: Found {totalBrokenSegments} incomplete/broken segments across {routesWithBrokenSegments.Count} routes. Re-enqueuing...");
 
-                    // If pass >= 2 and physical roadside stops failed, nudge them along road curve to adjust curb position
+                    // If pass >= 2 and physical roadside stops failed, nudge only improperly bound stops and batch road updates
                     if (_settlingPass >= 2)
                     {
+                        var nudgedRoads = new HashSet<Entity>();
                         foreach (var stopEntity in stopsToNudge)
                         {
-                            NudgeRoadsideBusStop(stopEntity);
+                            if (NudgeRoadsideBusStop(stopEntity, out Entity nudgedRoad, markRoadUpdated: false) && nudgedRoad != Entity.Null)
+                                nudgedRoads.Add(nudgedRoad);
                         }
+                        if (nudgedRoads.Count > 0)
+                            MarkRoadsUpdatedWithNodes(nudgedRoads);
+
                         foreach (var wpEntity in curbsideWaypointsToNudge)
                         {
                             NudgeCurbsideWaypoint(wpEntity);
@@ -1088,6 +1107,31 @@ namespace AutoBusLines
             _generationStage = GenerationStage.PlanningSetup;
             string phaseStatus = planOnly ? "planning" : "building";
             AutoBusLinesUISystem.Instance?.SetBuildProgress(0.08f, phaseStatus, "Analyzing road network and depot connections...");
+        }
+
+        /// <summary>
+        /// Groups pending virtual stops sharing the same RoadEntity consecutively while preserving
+        /// corridor order, so opposite-curb stops on a road batch into a single network update.
+        /// </summary>
+        private static void GroupPendingStopsByRoad(List<PlacedStop> stops)
+        {
+            var buckets = new Dictionary<Entity, List<PlacedStop>>(stops.Count);
+            var order = new List<Entity>(stops.Count);
+            for (int i = 0; i < stops.Count; i++)
+            {
+                var st = stops[i];
+                if (!buckets.TryGetValue(st.RoadEntity, out var list))
+                {
+                    list = new List<PlacedStop>(2);
+                    buckets[st.RoadEntity] = list;
+                    order.Add(st.RoadEntity);
+                }
+                list.Add(st);
+            }
+
+            stops.Clear();
+            for (int i = 0; i < order.Count; i++)
+                stops.AddRange(buckets[order[i]]);
         }
 
         private void StepPlanningSetup()

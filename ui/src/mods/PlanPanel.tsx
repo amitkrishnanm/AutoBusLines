@@ -53,7 +53,7 @@ const stopDensityBinding = bindValue<string>("autoBusLines", "stopDensity", "Bal
 const targetSpacingBinding = bindValue<number>("autoBusLines", "targetStopSpacing", 200);
 const selectedPrefabBinding = bindValue<string>("autoBusLines", "selectedStopPrefab", "All");
 const prefabOptionsBinding = bindValue<string>("autoBusLines", "stopPrefabOptions", "[]");
-const modVersionBinding = bindValue<string>("autoBusLines", "modVersion", "2.1.0");
+const modVersionBinding = bindValue<string>("autoBusLines", "modVersion", "2.1.0-hotfix");
 
 // District & Stops-only bindings
 const districtsListBinding = bindValue<string>("autoBusLines", "districtsList", "[]");

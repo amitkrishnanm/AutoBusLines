@@ -29,6 +29,8 @@ namespace AutoBusLines
             updateSystem.UpdateAt<RoadNetworkScanner>(SystemUpdatePhase.GameSimulation);
             updateSystem.UpdateAt<RoadDepotAssigner>(SystemUpdatePhase.GameSimulation);
             updateSystem.UpdateAt<BusLineGenerator>(SystemUpdatePhase.GameSimulation);
+            updateSystem.UpdateBefore<AutoBusLinesPreCompositionSystem, Game.Net.CompositionSelectSystem>(SystemUpdatePhase.Modification3);
+            updateSystem.UpdateAfter<AutoBusLinesTrafficSyncSystem, Game.Prefabs.NetCompositionSystem>(SystemUpdatePhase.Modification4);
             updateSystem.UpdateAt<AutoBusLinesUISystem>(SystemUpdatePhase.UIUpdate);
             updateSystem.UpdateAt<PlanRouteOverlaySystem>(SystemUpdatePhase.Rendering);
 
