@@ -727,26 +727,10 @@ namespace AutoBusLines
                             continue;
                         }
 
-                        bool isBroken = false;
-                        if (EntityManager.HasComponent<PathInformation>(segEnt))
-                        {
-                            var pi = EntityManager.GetComponentData<PathInformation>(segEnt);
-                            if (pi.m_Distance <= 0f)
-                            {
-                                isBroken = true;
-                            }
-                        }
-                        else
-                        {
-                            isBroken = true;
-                        }
+                        if (IsSegmentPathPending(segEnt))
+                            continue;
 
-                        if (!EntityManager.HasBuffer<PathElement>(segEnt) || EntityManager.GetBuffer<PathElement>(segEnt).Length == 0)
-                        {
-                            isBroken = true;
-                        }
-
-                        if (isBroken)
+                        if (IsSegmentBrokenCompleted(segEnt))
                         {
                             routeHasBrokenSegment = true;
                             totalBrokenSegments++;
@@ -755,58 +739,23 @@ namespace AutoBusLines
                             // The failed segment connects Waypoint s to Waypoint (s + 1) % wpBuf.Length
                             int wpIndexA = s;
                             int wpIndexB = (s + 1) % wpBuf.Length;
+                            bool refreshA = wpIndexA < wpBuf.Length &&
+                                ProcessBrokenEndpointWaypoint(wpBuf[wpIndexA].m_Waypoint, allowNudge: true, stopsToNudge, curbsideWaypointsToNudge: null);
+                            bool refreshB = wpIndexB < wpBuf.Length &&
+                                ProcessBrokenEndpointWaypoint(wpBuf[wpIndexB].m_Waypoint, allowNudge: true, stopsToNudge, curbsideWaypointsToNudge: null);
 
-                            if (wpIndexA < wpBuf.Length)
+                            if (refreshA)
                             {
-                                var wpA = wpBuf[wpIndexA].m_Waypoint;
-                                if (EntityManager.Exists(wpA) && !EntityManager.HasComponent<Deleted>(wpA))
-                                {
-                                    if (EntityManager.HasComponent<Connected>(wpA))
-                                    {
-                                        var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
-                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA) &&
-                                            ShouldNudgeStopForWaypoint(wpA, stopA))
-                                        {
-                                            stopsToNudge.Add(stopA);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        if (!EntityManager.HasComponent<Updated>(wpA))
-                                            EntityManager.AddComponentData(wpA, default(Updated));
-                                    }
-                                }
+                                int prevSegIdx = (s - 1 + segBuf.Length) % segBuf.Length;
+                                if (prevSegIdx < segBuf.Length)
+                                    segmentsToReset.Add(segBuf[prevSegIdx].m_Segment);
                             }
-
-                            if (wpIndexB < wpBuf.Length)
+                            if (refreshB)
                             {
-                                var wpB = wpBuf[wpIndexB].m_Waypoint;
-                                if (EntityManager.Exists(wpB) && !EntityManager.HasComponent<Deleted>(wpB))
-                                {
-                                    if (EntityManager.HasComponent<Connected>(wpB))
-                                    {
-                                        var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
-                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB) &&
-                                            ShouldNudgeStopForWaypoint(wpB, stopB))
-                                        {
-                                            stopsToNudge.Add(stopB);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        if (!EntityManager.HasComponent<Updated>(wpB))
-                                            EntityManager.AddComponentData(wpB, default(Updated));
-                                    }
-                                }
+                                int nextSegIdx = (s + 1) % segBuf.Length;
+                                if (nextSegIdx < segBuf.Length)
+                                    segmentsToReset.Add(segBuf[nextSegIdx].m_Segment);
                             }
-
-                            // Also reset adjacent segments touching these two waypoints
-                            int prevSegIdx = (s - 1 + segBuf.Length) % segBuf.Length;
-                            int nextSegIdx = (s + 1) % segBuf.Length;
-                            if (prevSegIdx < segBuf.Length)
-                                segmentsToReset.Add(segBuf[prevSegIdx].m_Segment);
-                            if (nextSegIdx < segBuf.Length)
-                                segmentsToReset.Add(segBuf[nextSegIdx].m_Segment);
                         }
                     }
 
@@ -842,37 +791,118 @@ namespace AutoBusLines
             if (nudgedRoads.Count > 0)
                 MarkRoadsUpdatedWithNodes(nudgedRoads);
 
-            // 2. Reset PathTargets and PathInformation on affected segments to force RoutePathSystem to recalculate
+            // 2. Reset PathTargets and PathInformation on affected segments and mark affected routes Updated
+            ResetRouteSegmentsForPathfinding(segmentsToReset, routesToUpdate);
+
+            log.Info($"=== Repair Complete: Nudged {stopsNudged} stops, reset {segmentsToReset.Count} segments across {brokenRoutesFound} routes. Re-enqueued pathfinding. ===");
+
+        }
+
+        /// <summary>
+        /// Returns true while a segment's pathfind has been enqueued by RoutePathSystem (Start/End lanes populated)
+        /// and has not yet received its RoutePathReadySystem completion event.
+        /// </summary>
+        private bool IsSegmentPathPending(Entity segEnt)
+        {
+            if (!EntityManager.HasComponent<PathInformation>(segEnt) ||
+                !EntityManager.HasComponent<PathTargets>(segEnt))
+                return false;
+
+            var pi = EntityManager.GetComponentData<PathInformation>(segEnt);
+            if (pi.m_Distance != 0f)
+                return false;
+
+            if (EntityManager.HasBuffer<PathElement>(segEnt) &&
+                EntityManager.GetBuffer<PathElement>(segEnt).Length > 0)
+                return false;
+
+            var pt = EntityManager.GetComponentData<PathTargets>(segEnt);
+            if (pt.m_StartLane == Entity.Null || pt.m_EndLane == Entity.Null)
+                return false;
+
+            return math.lengthsq(pt.m_ReadyStartPosition) < 1e-6f &&
+                   math.lengthsq(pt.m_ReadyEndPosition) < 1e-6f;
+        }
+
+        private bool IsSegmentBrokenCompleted(Entity segEnt)
+        {
+            if (!EntityManager.HasComponent<PathInformation>(segEnt))
+                return true;
+
+            var pi = EntityManager.GetComponentData<PathInformation>(segEnt);
+            if (pi.m_Distance <= 0f)
+                return true;
+
+            return !EntityManager.HasBuffer<PathElement>(segEnt) ||
+                   EntityManager.GetBuffer<PathElement>(segEnt).Length == 0;
+        }
+
+        /// <summary>
+        /// Checks a broken segment endpoint waypoint; only queues stop/curbside nudges and marks the waypoint
+        /// Updated when the waypoint actually lost lane binding or its stop will be nudged.
+        /// </summary>
+        private bool ProcessBrokenEndpointWaypoint(
+            Entity wp,
+            bool allowNudge,
+            HashSet<Entity> stopsToNudge,
+            HashSet<Entity> curbsideWaypointsToNudge)
+        {
+            if (!EntityManager.Exists(wp) || EntityManager.HasComponent<Deleted>(wp))
+                return false;
+
+            bool missingRouteLane = !EntityManager.HasComponent<RouteLane>(wp) ||
+                                    EntityManager.GetComponentData<RouteLane>(wp).m_StartLane == Entity.Null ||
+                                    EntityManager.GetComponentData<RouteLane>(wp).m_EndLane == Entity.Null;
+            bool missingAccessLane = EntityManager.HasComponent<AccessLane>(wp) &&
+                                     EntityManager.GetComponentData<AccessLane>(wp).m_Lane == Entity.Null;
+            bool needsWpRefresh = missingRouteLane || missingAccessLane;
+
+            if (EntityManager.HasComponent<Connected>(wp))
+            {
+                var stop = EntityManager.GetComponentData<Connected>(wp).m_Connected;
+                if (stop != Entity.Null && EntityManager.Exists(stop) && !EntityManager.HasComponent<Deleted>(stop) &&
+                    ShouldNudgeStopForWaypoint(wp, stop))
+                {
+                    stopsToNudge.Add(stop);
+                    if (allowNudge)
+                        needsWpRefresh = true;
+                }
+            }
+            else if (allowNudge && curbsideWaypointsToNudge != null)
+            {
+                curbsideWaypointsToNudge.Add(wp);
+                needsWpRefresh = true;
+            }
+
+            if (needsWpRefresh && !EntityManager.HasComponent<Updated>(wp))
+                EntityManager.AddComponentData(wp, default(Updated));
+
+            return needsWpRefresh;
+        }
+
+        private void ResetRouteSegmentsForPathfinding(HashSet<Entity> segmentsToReset, HashSet<Entity> routesToUpdate)
+        {
             foreach (var segEnt in segmentsToReset)
             {
                 if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
                     continue;
 
                 if (EntityManager.HasComponent<PathTargets>(segEnt))
-                {
                     EntityManager.SetComponentData(segEnt, new PathTargets());
-                }
 
                 if (EntityManager.HasComponent<PathInformation>(segEnt))
-                {
                     EntityManager.SetComponentData(segEnt, default(PathInformation));
-                }
 
                 if (EntityManager.HasBuffer<PathElement>(segEnt))
-                {
                     EntityManager.GetBuffer<PathElement>(segEnt).Clear();
-                }
 
                 if (EntityManager.HasBuffer<CurveElement>(segEnt))
-                {
                     EntityManager.GetBuffer<CurveElement>(segEnt).Clear();
-                }
 
                 if (!EntityManager.HasComponent<Updated>(segEnt))
                     EntityManager.AddComponentData(segEnt, default(Updated));
             }
 
-            // 3. Mark routes as Updated to trigger route updates in native systems
             foreach (var routeEntity in routesToUpdate)
             {
                 if (!EntityManager.Exists(routeEntity) || EntityManager.HasComponent<Deleted>(routeEntity))
@@ -883,9 +913,6 @@ namespace AutoBusLines
                 if (!EntityManager.HasComponent<BatchesUpdated>(routeEntity))
                     EntityManager.AddComponentData(routeEntity, default(BatchesUpdated));
             }
-
-            log.Info($"=== Repair Complete: Nudged {stopsNudged} stops, reset {segmentsToReset.Count} segments across {brokenRoutesFound} routes. Re-enqueued pathfinding. ===");
-
         }
 
         /// <summary>
@@ -1416,6 +1443,7 @@ namespace AutoBusLines
             _createdRouteEntities.Clear();
             _settlingWaitCounter = 0;
             _settlingPass = 0;
+            _settlingPendingWaitPasses = 0;
 
             if (_totalVirtualStopsToCreate > 0)
             {
@@ -1668,6 +1696,305 @@ namespace AutoBusLines
                     });
                 }
             }
+
+            PopulateLegalNodeTurns(nodePositions.Keys);
+        }
+
+        private struct DirectedNodeArc
+        {
+            public ulong FromKey;
+            public ulong ToKey;
+        }
+
+        private static ulong MakePathNodeKey(Game.Pathfind.PathNode pathNode)
+        {
+            return ((ulong)(uint)pathNode.GetOwnerIndex() << 32) | (uint)pathNode.GetLaneIndex();
+        }
+
+        /// <summary>
+        /// Scans each graph junction node's live SubLane buffer and connected edge boundary PathNodes
+        /// to record which (fromEdge, toEdge) vehicle turns exist for buses, respecting vanilla turn
+        /// prohibitions, medians, node-owned PathNode seams, and Traffic mod custom connections.
+        /// </summary>
+        private void PopulateLegalNodeTurns(IEnumerable<Entity> graphNodes)
+        {
+            _legalNodeTurns = new Dictionary<Entity, HashSet<(Entity, Entity)>>();
+            _nodesWithCarSubLanes = new HashSet<Entity>();
+
+            foreach (Entity node in graphNodes)
+            {
+                if (node == Entity.Null || !EntityManager.Exists(node))
+                    continue;
+
+                CollectLegalTurnsForNode(node);
+            }
+        }
+
+        private bool IsBusUsableCarSubLane(Entity subLane, out Game.Net.CarLane carLane)
+        {
+            carLane = default;
+            if (subLane == Entity.Null ||
+                EntityManager.HasComponent<Game.Net.SlaveLane>(subLane) ||
+                !EntityManager.HasComponent<Game.Net.CarLane>(subLane) ||
+                !EntityManager.HasComponent<Game.Net.Lane>(subLane))
+            {
+                return false;
+            }
+
+            carLane = EntityManager.GetComponentData<Game.Net.CarLane>(subLane);
+            if ((carLane.m_Flags & Game.Net.CarLaneFlags.SideConnection) != 0)
+                return false;
+
+            if (EntityManager.HasComponent<PrefabRef>(subLane))
+            {
+                Entity lp = EntityManager.GetComponentData<PrefabRef>(subLane).m_Prefab;
+                if (lp != Entity.Null && EntityManager.HasComponent<CarLaneData>(lp))
+                {
+                    var cld = EntityManager.GetComponentData<CarLaneData>(lp);
+                    if ((cld.m_RoadTypes & Game.Net.RoadTypes.Car) == 0)
+                        return false;
+                    if (cld.m_MaxSize != SizeClass.Undefined &&
+                        (int)cld.m_MaxSize < (int)SizeClass.Large)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private void CollectLegalTurnsForNode(Entity node)
+        {
+            if (!EntityManager.HasBuffer<Game.Net.SubLane>(node) ||
+                !EntityManager.HasBuffer<ConnectedEdge>(node))
+            {
+                return;
+            }
+
+            var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(node);
+            if (subLanes.Length == 0)
+                return;
+
+            bool hasAnyCarSubLane = false;
+            var arcs = new List<DirectedNodeArc>(subLanes.Length * 2);
+
+            for (int i = 0; i < subLanes.Length; i++)
+            {
+                Entity sl = subLanes[i].m_SubLane;
+                if (sl == Entity.Null ||
+                    EntityManager.HasComponent<Game.Net.SlaveLane>(sl) ||
+                    !EntityManager.HasComponent<Game.Net.CarLane>(sl) ||
+                    !EntityManager.HasComponent<Game.Net.Lane>(sl))
+                {
+                    continue;
+                }
+
+                var carLane = EntityManager.GetComponentData<Game.Net.CarLane>(sl);
+                if ((carLane.m_Flags & Game.Net.CarLaneFlags.SideConnection) != 0)
+                    continue;
+
+                bool sizeTooSmall = false;
+                if (EntityManager.HasComponent<PrefabRef>(sl))
+                {
+                    Entity lp = EntityManager.GetComponentData<PrefabRef>(sl).m_Prefab;
+                    if (lp != Entity.Null && EntityManager.HasComponent<CarLaneData>(lp))
+                    {
+                        var cld = EntityManager.GetComponentData<CarLaneData>(lp);
+                        if ((cld.m_RoadTypes & Game.Net.RoadTypes.Car) == 0)
+                            continue;
+                        if (cld.m_MaxSize != SizeClass.Undefined &&
+                            (int)cld.m_MaxSize < (int)SizeClass.Large)
+                        {
+                            sizeTooSmall = true;
+                        }
+                    }
+                }
+
+                hasAnyCarSubLane = true;
+                if (sizeTooSmall || (carLane.m_Flags & Game.Net.CarLaneFlags.Forbidden) != 0)
+                    continue;
+
+                var laneData = EntityManager.GetComponentData<Game.Net.Lane>(sl);
+                ulong startKey = MakePathNodeKey(laneData.m_StartNode);
+                ulong endKey = MakePathNodeKey(laneData.m_EndNode);
+                arcs.Add(new DirectedNodeArc { FromKey = startKey, ToKey = endKey });
+                if ((carLane.m_Flags & Game.Net.CarLaneFlags.Twoway) != 0)
+                    arcs.Add(new DirectedNodeArc { FromKey = endKey, ToKey = startKey });
+            }
+
+            if (!hasAnyCarSubLane)
+                return;
+
+            _nodesWithCarSubLanes.Add(node);
+            var legalTurns = new HashSet<(Entity, Entity)>();
+            _legalNodeTurns[node] = legalTurns;
+            if (arcs.Count == 0)
+                return;
+
+            var entryKeysByEdge = new Dictionary<Entity, List<ulong>>();
+            var exitEdgesByPathKey = new Dictionary<ulong, List<Entity>>();
+            var connEdges = EntityManager.GetBuffer<ConnectedEdge>(node);
+            var seenEdges = new HashSet<Entity>();
+
+            for (int i = 0; i < connEdges.Length; i++)
+            {
+                Entity edgeEnt = connEdges[i].m_Edge;
+                if (edgeEnt == Entity.Null || !seenEdges.Add(edgeEnt) ||
+                    !EntityManager.HasComponent<Game.Net.Edge>(edgeEnt) ||
+                    !EntityManager.HasBuffer<Game.Net.SubLane>(edgeEnt))
+                {
+                    continue;
+                }
+
+                var edgeData = EntityManager.GetComponentData<Game.Net.Edge>(edgeEnt);
+                bool atStart = edgeData.m_Start == node;
+                bool atEnd = edgeData.m_End == node;
+                if (!atStart && !atEnd)
+                    continue;
+
+                var edgeSubLanes = EntityManager.GetBuffer<Game.Net.SubLane>(edgeEnt);
+                if (edgeSubLanes.Length == 0)
+                    continue;
+
+                // Track edge-owned keys that appear as both Start and End inside this edge (mid-block stop splits)
+                // so internal seams are never treated as junction endpoints.
+                var internalStartKeys = new HashSet<ulong>();
+                var internalEndKeys = new HashSet<ulong>();
+                int edgeIdx = edgeEnt.Index;
+                for (int l = 0; l < edgeSubLanes.Length; l++)
+                {
+                    Entity esl = edgeSubLanes[l].m_SubLane;
+                    if (!IsBusUsableCarSubLane(esl, out var eCar) ||
+                        (eCar.m_Flags & Game.Net.CarLaneFlags.Forbidden) != 0)
+                    {
+                        continue;
+                    }
+
+                    var elData = EntityManager.GetComponentData<Game.Net.Lane>(esl);
+                    if (elData.m_StartNode.GetOwnerIndex() == edgeIdx)
+                        internalStartKeys.Add(MakePathNodeKey(elData.m_StartNode));
+                    if (elData.m_EndNode.GetOwnerIndex() == edgeIdx)
+                        internalEndKeys.Add(MakePathNodeKey(elData.m_EndNode));
+                }
+
+                for (int l = 0; l < edgeSubLanes.Length; l++)
+                {
+                    Entity esl = edgeSubLanes[l].m_SubLane;
+                    if (!IsBusUsableCarSubLane(esl, out var eCar) ||
+                        (eCar.m_Flags & Game.Net.CarLaneFlags.Forbidden) != 0)
+                    {
+                        continue;
+                    }
+
+                    bool invert = (eCar.m_Flags & Game.Net.CarLaneFlags.Invert) != 0;
+                    bool twoway = (eCar.m_Flags & Game.Net.CarLaneFlags.Twoway) != 0;
+                    var elData = EntityManager.GetComponentData<Game.Net.Lane>(esl);
+
+                    bool endFacesNode = (atEnd && !invert) || (atStart && invert);
+                    bool startFacesNode = (atStart && !invert) || (atEnd && invert);
+
+                    if (endFacesNode)
+                    {
+                        ulong endKey = MakePathNodeKey(elData.m_EndNode);
+                        bool isInternalSeam = elData.m_EndNode.GetOwnerIndex() == edgeIdx &&
+                                              internalStartKeys.Contains(endKey);
+                        if (!isInternalSeam)
+                        {
+                            AddEdgePathKey(entryKeysByEdge, edgeEnt, endKey);
+                            if (twoway)
+                                AddPathKeyExitEdge(exitEdgesByPathKey, endKey, edgeEnt);
+                        }
+                    }
+
+                    if (startFacesNode)
+                    {
+                        ulong startKey = MakePathNodeKey(elData.m_StartNode);
+                        bool isInternalSeam = elData.m_StartNode.GetOwnerIndex() == edgeIdx &&
+                                              internalEndKeys.Contains(startKey);
+                        if (!isInternalSeam)
+                        {
+                            AddPathKeyExitEdge(exitEdgesByPathKey, startKey, edgeEnt);
+                            if (twoway)
+                                AddEdgePathKey(entryKeysByEdge, edgeEnt, startKey);
+                        }
+                    }
+                }
+            }
+
+            if (entryKeysByEdge.Count == 0 || exitEdgesByPathKey.Count == 0)
+                return;
+
+            var outgoingByKey = new Dictionary<ulong, List<ulong>>(arcs.Count);
+            for (int i = 0; i < arcs.Count; i++)
+            {
+                DirectedNodeArc arc = arcs[i];
+                if (!outgoingByKey.TryGetValue(arc.FromKey, out var list))
+                {
+                    list = new List<ulong>();
+                    outgoingByKey[arc.FromKey] = list;
+                }
+                list.Add(arc.ToKey);
+            }
+
+            var queue = new Queue<ulong>();
+            var visitedKeys = new HashSet<ulong>();
+
+            foreach (var kv in entryKeysByEdge)
+            {
+                Entity fromEdge = kv.Key;
+                queue.Clear();
+                visitedKeys.Clear();
+
+                List<ulong> entries = kv.Value;
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    ulong k = entries[i];
+                    if (visitedKeys.Add(k))
+                        queue.Enqueue(k);
+                }
+
+                while (queue.Count > 0)
+                {
+                    ulong curKey = queue.Dequeue();
+                    if (exitEdgesByPathKey.TryGetValue(curKey, out var toEdges))
+                    {
+                        for (int i = 0; i < toEdges.Count; i++)
+                            legalTurns.Add((fromEdge, toEdges[i]));
+                    }
+
+                    if (!outgoingByKey.TryGetValue(curKey, out var nextKeys))
+                        continue;
+
+                    for (int i = 0; i < nextKeys.Count; i++)
+                    {
+                        ulong nk = nextKeys[i];
+                        if (visitedKeys.Add(nk))
+                            queue.Enqueue(nk);
+                    }
+                }
+            }
+        }
+
+        private static void AddEdgePathKey(Dictionary<Entity, List<ulong>> map, Entity edge, ulong key)
+        {
+            if (!map.TryGetValue(edge, out var list))
+            {
+                list = new List<ulong>();
+                map[edge] = list;
+            }
+            list.Add(key);
+        }
+
+        private static void AddPathKeyExitEdge(Dictionary<ulong, List<Entity>> map, ulong key, Entity edge)
+        {
+            if (!map.TryGetValue(key, out var list))
+            {
+                list = new List<Entity>();
+                map[key] = list;
+            }
+            if (!list.Contains(edge))
+                list.Add(edge);
         }
 
         private void IndexStopsByDirectedEdge(
@@ -2958,6 +3285,19 @@ namespace AutoBusLines
                 }
                 string sampleSuffix = matchEndNode > 0 ? matches.ToString() : (nonMatchCount > 0 ? $" sampleNonMatch:{nonMatches}" : "");
                 log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   ExitNode={exitNode} totalCar={totalCar} matchEnd={matchEndNode} matchStart={matchStartNode}{sampleSuffix}");
+            }
+
+            if (roadB != Entity.Null && laneB != Entity.Null && EntityManager.HasComponent<Game.Net.Edge>(roadB) && EntityManager.HasComponent<Game.Net.Lane>(laneB))
+            {
+                var eB = EntityManager.GetComponentData<Game.Net.Edge>(roadB);
+                Entity entryNodeB = EntityManager.HasComponent<Game.Net.CarLane>(laneB) &&
+                                    (EntityManager.GetComponentData<Game.Net.CarLane>(laneB).m_Flags & Game.Net.CarLaneFlags.Invert) != 0
+                    ? eB.m_End
+                    : eB.m_Start;
+                if (entryNodeB != Entity.Null)
+                {
+                    log.Info($"[BrokenDiag][{contextLabel}][{kind}#{sampleNum}]   EntryNodeB={entryNodeB}: {TrafficCompatState.DescribeNodeState(EntityManager, entryNodeB)}");
+                }
             }
 
             if (laneA != Entity.Null && laneB != Entity.Null)

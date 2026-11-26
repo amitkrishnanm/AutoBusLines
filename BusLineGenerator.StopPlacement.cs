@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Colossal.Collections;
 using Colossal.Logging;
 using Colossal.Mathematics;
 using Game;
@@ -13,6 +14,7 @@ using Game.Tools;
 using Game.Areas;
 using Unity.Entities;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using Edge = Game.Net.Edge;
@@ -790,11 +792,12 @@ namespace AutoBusLines
             return radius;
         }
 
-        private static readonly float[] CurbShiftMeters = { 16f, -16f, 24f, -24f };
+        private static readonly float[] CurbShiftMeters = { 16f, -16f, 24f, -24f, 36f, -36f };
 
         /// <summary>
         /// Attempts to snap onto the road's buildable curb area at the requested curve parameter,
-        /// probing short longitudinal shifts along the same edge if blocked (e.g. near a tram stop).
+        /// probing short longitudinal shifts along the same edge if blocked (e.g. near a tram stop
+        /// or an adjacent Area road ConnectionLane such as a parking lot or depot driveway).
         /// </summary>
         private bool TrySnapToRoadCurbAreaWithShift(
             Entity roadEntity,
@@ -821,7 +824,7 @@ namespace AutoBusLines
 
             var roadCurve = EntityManager.GetComponentData<Curve>(roadEntity);
             float roadLength = MathUtils.Length(roadCurve.m_Bezier.xz);
-            if (roadLength <= 30f)
+            if (roadLength <= 20f)
                 return false;
 
             for (int i = 0; i < CurbShiftMeters.Length; i++)
@@ -896,7 +899,7 @@ namespace AutoBusLines
             float2 outerBoundaryXZ = approxRoadCenter.xz + curbDir * (netComp.m_Width * 0.5f);
             bool hasRouteSnap = TryFindRouteCurbSnapPos(
                 in edgeGeom, comp.m_Edge, in netComp, outerBoundaryXZ, stopPrefabEntity,
-                out float3 routeSnapPos);
+                out float3 routeSnapPos, out float3 carLaneCenterPos, out float carLaneHalfWidth);
             float2 targetXZ = hasRouteSnap ? routeSnapPos.xz : outerBoundaryXZ;
 
             float bestDistSq = float.MaxValue;
@@ -904,74 +907,103 @@ namespace AutoBusLines
             float3 bestPos = default;
             float2 bestDirXZ = default;
 
-            for (int segIdx = 0; segIdx < 2; segIdx++)
+            Game.Areas.SearchSystem areaSearchSystem = null;
+            NativeQuadTree<AreaSearchItem, QuadTreeBoundsXZ> areaSearchTree = default;
+            bool acquiredAreaTree = false;
+
+            try
             {
-                var seg = (segIdx == 0) ? edgeGeom.m_Start : edgeGeom.m_End;
-
-                for (int i = 0; i < areas.Length; i++)
+                for (int segIdx = 0; segIdx < 2; segIdx++)
                 {
-                    var area = areas[i];
-                    if ((area.m_Flags & NetAreaFlags.Buildable) == 0 || (area.m_Flags & NetAreaFlags.Median) != 0)
-                        continue;
+                    var seg = (segIdx == 0) ? edgeGeom.m_Start : edgeGeom.m_End;
 
-                    // Verify geometric side against approxCurbNormal when provided; fallback to m_Position.x sign
-                    Bezier4x3 areaCurve = MathUtils.Lerp(seg.m_Left, seg.m_Right, area.m_Position.x / netComp.m_Width + 0.5f);
-                    MathUtils.Distance(areaCurve.xz, targetXZ, out float segT);
-                    float3 candidatePos = MathUtils.Position(areaCurve, segT);
-
-                    if (math.lengthsq(approxCurbNormal.xz) > 0.001f)
+                    for (int i = 0; i < areas.Length; i++)
                     {
-                        if (math.dot(candidatePos.xz - approxRoadCenter.xz, approxCurbNormal.xz) <= 0f)
+                        var area = areas[i];
+                        if ((area.m_Flags & NetAreaFlags.Buildable) == 0 || (area.m_Flags & NetAreaFlags.Median) != 0)
                             continue;
-                    }
-                    else
-                    {
-                        bool areaIsRight = area.m_Position.x > 0f;
-                        if (areaIsRight != isRightSide)
+
+                        // Verify geometric side against approxCurbNormal when provided; fallback to m_Position.x sign
+                        Bezier4x3 areaCurve = MathUtils.Lerp(seg.m_Left, seg.m_Right, area.m_Position.x / netComp.m_Width + 0.5f);
+                        MathUtils.Distance(areaCurve.xz, targetXZ, out float segT);
+                        float3 candidatePos = MathUtils.Position(areaCurve, segT);
+
+                        if (math.lengthsq(approxCurbNormal.xz) > 0.001f)
+                        {
+                            if (math.dot(candidatePos.xz - approxRoadCenter.xz, approxCurbNormal.xz) <= 0f)
+                                continue;
+                        }
+                        else
+                        {
+                            bool areaIsRight = area.m_Position.x > 0f;
+                            if (areaIsRight != isRightSide)
+                                continue;
+                        }
+
+                        hadBuildableArea = true;
+
+                        // Must match CS2 AttachPositionSystem & ObjectToolSystem fit requirement unless explicitly overridden for oversized user-selected shelters
+                        if (!allowOversize && radius >= area.m_Width * 0.51f)
                             continue;
-                    }
 
-                    hadBuildableArea = true;
+                        float2 tanXZ = math.normalizesafe(MathUtils.Tangent(areaCurve, segT).xz);
+                        if (math.lengthsq(tanXZ) < 0.0001f)
+                            continue;
 
-                    // Must match CS2 AttachPositionSystem & ObjectToolSystem fit requirement unless explicitly overridden for oversized user-selected shelters
-                    if (!allowOversize && radius >= area.m_Width * 0.51f)
-                        continue;
+                        float2 dirXZ = ((area.m_Flags & NetAreaFlags.Invert) != 0)
+                            ? MathUtils.Right(tanXZ)
+                            : MathUtils.Left(tanXZ);
 
-                    float2 tanXZ = math.normalizesafe(MathUtils.Tangent(areaCurve, segT).xz);
-                    if (math.lengthsq(tanXZ) < 0.0001f)
-                        continue;
+                        float3 snapLinePos = MathUtils.Position(
+                            MathUtils.Lerp(seg.m_Left, seg.m_Right, area.m_SnapPosition.x / netComp.m_Width + 0.5f),
+                            segT);
+                        float maxLength = math.max(0f, math.min(
+                            area.m_Width * 0.5f,
+                            math.abs(area.m_SnapPosition.x - area.m_Position.x) + area.m_SnapWidth * 0.5f) - radius);
 
-                    float2 dirXZ = ((area.m_Flags & NetAreaFlags.Invert) != 0)
-                        ? MathUtils.Right(tanXZ)
-                        : MathUtils.Left(tanXZ);
+                        candidatePos.xz += MathUtils.ClampLength(snapLinePos.xz - candidatePos.xz, maxLength);
+                        if (hasRouteSnap)
+                        {
+                            float maxLength2 = math.max(0f, area.m_SnapWidth * 0.5f - radius);
+                            candidatePos.xz += MathUtils.ClampLength(routeSnapPos.xz - candidatePos.xz, maxLength2);
+                        }
+                        candidatePos.y += area.m_Position.y;
 
-                    float3 snapLinePos = MathUtils.Position(
-                        MathUtils.Lerp(seg.m_Left, seg.m_Right, area.m_SnapPosition.x / netComp.m_Width + 0.5f),
-                        segT);
-                    float maxLength = math.max(0f, math.min(
-                        area.m_Width * 0.5f,
-                        math.abs(area.m_SnapPosition.x - area.m_Position.x) + area.m_SnapWidth * 0.5f) - radius);
+                        if (HasConflictingNonBusStopNearPosition(roadEntity, candidatePos, candidatePos.xz - approxRoadCenter.xz, minClearance: 14f))
+                            continue;
 
-                    candidatePos.xz += MathUtils.ClampLength(snapLinePos.xz - candidatePos.xz, maxLength);
-                    if (hasRouteSnap)
-                    {
-                        float maxLength2 = math.max(0f, area.m_SnapWidth * 0.5f - radius);
-                        candidatePos.xz += MathUtils.ClampLength(routeSnapPos.xz - candidatePos.xz, maxLength2);
-                    }
-                    candidatePos.y += area.m_Position.y;
+                        if (!acquiredAreaTree)
+                        {
+                            areaSearchSystem = World.GetExistingSystemManaged<Game.Areas.SearchSystem>();
+                            if (areaSearchSystem != null)
+                            {
+                                areaSearchTree = areaSearchSystem.GetSearchTree(true, out JobHandle areaDeps);
+                                areaDeps.Complete();
+                                acquiredAreaTree = true;
+                            }
+                        }
 
-                    if (HasConflictingNonBusStopNearPosition(roadEntity, candidatePos, candidatePos.xz - approxRoadCenter.xz, minClearance: 14f))
-                        continue;
+                        if (acquiredAreaTree && HasCompetingAreaRoadConnection(
+                                roadEntity, candidatePos, carLaneCenterPos, carLaneHalfWidth, areaSearchTree))
+                        {
+                            continue;
+                        }
 
-                    float dSq = math.distancesq(candidatePos.xz, targetXZ);
-                    if (dSq < bestDistSq)
-                    {
-                        bestDistSq = dSq;
-                        bestPos = candidatePos;
-                        bestDirXZ = dirXZ;
-                        found = true;
+                        float dSq = math.distancesq(candidatePos.xz, targetXZ);
+                        if (dSq < bestDistSq)
+                        {
+                            bestDistSq = dSq;
+                            bestPos = candidatePos;
+                            bestDirXZ = dirXZ;
+                            found = true;
+                        }
                     }
                 }
+            }
+            finally
+            {
+                if (acquiredAreaTree)
+                    areaSearchSystem.AddSearchTreeReader(default);
             }
 
             if (!found)
@@ -981,6 +1013,149 @@ namespace AutoBusLines
             snappedRot = ToolUtils.CalculateRotation(bestDirXZ);
             MathUtils.Distance(roadCurve.m_Bezier.xz, bestPos.xz, out snappedRoadT);
             return true;
+        }
+
+        private struct AreaRoadConnectionHazardIterator : INativeQuadTreeIterator<AreaSearchItem, QuadTreeBoundsXZ>, IUnsafeQuadTreeIterator<AreaSearchItem, QuadTreeBoundsXZ>
+        {
+            public EntityManager EntityManager;
+            public Bounds2 SearchBounds;
+            public float2 PosXZ;
+            public float PosY;
+            public float MaxHazardDist;
+            public bool FoundHazard;
+
+            public bool Intersect(QuadTreeBoundsXZ bounds)
+            {
+                return !FoundHazard && MathUtils.Intersect(bounds.m_Bounds.xz, SearchBounds);
+            }
+
+            public void Iterate(QuadTreeBoundsXZ bounds, AreaSearchItem areaItem)
+            {
+                if (FoundHazard || !MathUtils.Intersect(bounds.m_Bounds.xz, SearchBounds))
+                    return;
+
+                Entity areaEntity = areaItem.m_Area;
+                if (!EntityManager.HasBuffer<Game.Areas.Node>(areaEntity) ||
+                    !EntityManager.HasBuffer<Game.Areas.Triangle>(areaEntity) ||
+                    !EntityManager.HasBuffer<Game.Net.SubLane>(areaEntity))
+                {
+                    return;
+                }
+
+                var triangles = EntityManager.GetBuffer<Game.Areas.Triangle>(areaEntity, true);
+                if (areaItem.m_Triangle < 0 || areaItem.m_Triangle >= triangles.Length)
+                    return;
+
+                var nodes = EntityManager.GetBuffer<Game.Areas.Node>(areaEntity, true);
+                Triangle3 tri = AreaUtils.GetTriangle3(nodes, triangles[areaItem.m_Triangle]);
+                float triDist = MathUtils.Distance(tri.xz, PosXZ, out float2 triT);
+                if (triDist > MaxHazardDist)
+                    return;
+
+                float3 triPos = MathUtils.Position(tri, triT);
+                if (math.abs(triPos.y - PosY) > 4.0f)
+                    return;
+
+                var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(areaEntity, true);
+                for (int i = 0; i < subLanes.Length; i++)
+                {
+                    Entity laneEntity = subLanes[i].m_SubLane;
+                    if (!EntityManager.HasComponent<Game.Net.ConnectionLane>(laneEntity) ||
+                        !EntityManager.HasComponent<Curve>(laneEntity))
+                    {
+                        continue;
+                    }
+
+                    var connLane = EntityManager.GetComponentData<Game.Net.ConnectionLane>(laneEntity);
+                    if ((connLane.m_Flags & ConnectionLaneFlags.Road) == 0 ||
+                        (connLane.m_RoadTypes & RoadTypes.Car) == 0)
+                    {
+                        continue;
+                    }
+
+                    Curve laneCurve = EntityManager.GetComponentData<Curve>(laneEntity);
+                    if (MathUtils.Intersect(tri.xz, laneCurve.m_Bezier.a.xz, out _) ||
+                        MathUtils.Intersect(tri.xz, laneCurve.m_Bezier.d.xz, out _))
+                    {
+                        FoundHazard = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        private bool HasCompetingAreaRoadConnection(
+            Entity roadEntity,
+            float3 candidatePos,
+            float3 fallbackCarCenterPos,
+            float fallbackCarHalfWidth,
+            NativeQuadTree<AreaSearchItem, QuadTreeBoundsXZ> areaSearchTree)
+        {
+            float carDist = ComputeRoadCarLaneDistance(roadEntity, candidatePos.xz, fallbackCarCenterPos, fallbackCarHalfWidth);
+            float maxHazardDist = carDist + 0.15f;
+            float2 expand = new float2(maxHazardDist, maxHazardDist);
+
+            var iterator = new AreaRoadConnectionHazardIterator
+            {
+                EntityManager = EntityManager,
+                SearchBounds = new Bounds2(candidatePos.xz - expand, candidatePos.xz + expand),
+                PosXZ = candidatePos.xz,
+                PosY = candidatePos.y,
+                MaxHazardDist = maxHazardDist,
+                FoundHazard = false
+            };
+
+            areaSearchTree.Iterate(ref iterator);
+            return iterator.FoundHazard;
+        }
+
+        private float ComputeRoadCarLaneDistance(
+            Entity roadEntity,
+            float2 posXZ,
+            float3 fallbackCarCenterPos,
+            float fallbackCarHalfWidth)
+        {
+            float minDist = float.MaxValue;
+            if (EntityManager.HasBuffer<Game.Net.SubLane>(roadEntity))
+            {
+                var subLanes = EntityManager.GetBuffer<Game.Net.SubLane>(roadEntity, true);
+                for (int i = 0; i < subLanes.Length; i++)
+                {
+                    Entity laneEnt = subLanes[i].m_SubLane;
+                    if (laneEnt == Entity.Null ||
+                        EntityManager.HasComponent<Game.Net.SlaveLane>(laneEnt) ||
+                        !EntityManager.HasComponent<Game.Net.CarLane>(laneEnt) ||
+                        !EntityManager.HasComponent<Curve>(laneEnt) ||
+                        !EntityManager.HasComponent<PrefabRef>(laneEnt))
+                    {
+                        continue;
+                    }
+
+                    Entity lanePrefab = EntityManager.GetComponentData<PrefabRef>(laneEnt).m_Prefab;
+                    if (lanePrefab == Entity.Null || !EntityManager.HasComponent<CarLaneData>(lanePrefab))
+                        continue;
+
+                    var cld = EntityManager.GetComponentData<CarLaneData>(lanePrefab);
+                    if ((cld.m_RoadTypes & RoadTypes.Car) == 0)
+                        continue;
+
+                    float halfWidth = EntityManager.HasComponent<NetLaneData>(lanePrefab)
+                        ? EntityManager.GetComponentData<NetLaneData>(lanePrefab).m_Width * 0.5f
+                        : 0f;
+                    Curve c = EntityManager.GetComponentData<Curve>(laneEnt);
+                    float dist = MathUtils.Distance(c.m_Bezier.xz, posXZ, out _);
+                    dist = math.max(0f, dist - halfWidth);
+                    if (dist < minDist)
+                        minDist = dist;
+                }
+            }
+
+            if (minDist < float.MaxValue)
+                return minDist;
+
+            return fallbackCarHalfWidth > 0f || math.lengthsq(fallbackCarCenterPos) > 0.001f
+                ? math.max(0f, math.distance(posXZ, fallbackCarCenterPos.xz) - fallbackCarHalfWidth)
+                : 4.0f;
         }
 
         /// <summary>
@@ -994,9 +1169,13 @@ namespace AutoBusLines
             in NetCompositionData netComp,
             float2 outerBoundaryXZ,
             Entity stopPrefabEntity,
-            out float3 routeSnapPos)
+            out float3 routeSnapPos,
+            out float3 carLaneCenterPos,
+            out float carLaneHalfWidth)
         {
             routeSnapPos = default;
+            carLaneCenterPos = default;
+            carLaneHalfWidth = 0f;
             if (edgeComposition == Entity.Null || !EntityManager.HasBuffer<NetCompositionLane>(edgeComposition))
                 return false;
 
@@ -1052,6 +1231,8 @@ namespace AutoBusLines
 
                     bestDistSq = distSq;
                     routeSnapPos = MathUtils.Position(curbEdgeCurve, laneT);
+                    carLaneCenterPos = curvePos;
+                    carLaneHalfWidth = laneWidth * 0.5f;
                     found = true;
                 }
             }

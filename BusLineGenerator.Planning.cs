@@ -37,6 +37,10 @@ namespace AutoBusLines
         // Node -> number of distinct road edges touching it (filled by BuildDirectedRoadGraph).
         private Dictionary<Entity, int> _nodeDegree = new Dictionary<Entity, int>();
 
+        // Node -> legal (fromEdge, toEdge) transitions from live SubLanes (for nodes with CarLane SubLanes).
+        private Dictionary<Entity, HashSet<(Entity, Entity)>> _legalNodeTurns = new Dictionary<Entity, HashSet<(Entity, Entity)>>();
+        private HashSet<Entity> _nodesWithCarSubLanes = new HashSet<Entity>();
+
         private struct SearchState
         {
             public DirectedRoadEdge Edge;
@@ -105,11 +109,25 @@ namespace AutoBusLines
             return math.dot(headingIn, headingOut) < HAIRPIN_COS;
         }
 
-        // A bus may turn from headingIn to headingOut at this node unless that is a hairpin U-turn.
-        // Dead ends are the exception: the game turns vehicles around there.
-        private bool CanTurn(Entity node, float3 headingIn, float3 headingOut)
+        private bool IsLegalNodeTurn(Entity node, Entity fromEdge, Entity toEdge)
         {
-            return !IsHairpin(headingIn, headingOut) || IsDeadEndNode(node);
+            if (fromEdge == Entity.Null || toEdge == Entity.Null)
+                return true;
+            if (!_nodesWithCarSubLanes.Contains(node))
+                return true;
+            return _legalNodeTurns.TryGetValue(node, out var turns) && turns.Contains((fromEdge, toEdge));
+        }
+
+        // A bus may turn from (fromEdge, headingIn) to (toEdge, headingOut) at this node unless
+        // it is an illegal hairpin U-turn or disallowed by live node SubLane turn connectivity.
+        // Dead ends are the exception: the game turns vehicles around there.
+        private bool CanTurn(Entity node, Entity fromEdge, float3 headingIn, Entity toEdge, float3 headingOut)
+        {
+            if (IsDeadEndNode(node))
+                return true;
+            if (IsHairpin(headingIn, headingOut))
+                return false;
+            return IsLegalNodeTurn(node, fromEdge, toEdge);
         }
 
         private bool IsLeftHandTraffic()
@@ -309,7 +327,9 @@ namespace AutoBusLines
             Dictionary<Entity, float3> nodePositions,
             float maxSearchDistance = 2000.0f,
             bool requireNonEmpty = false,
-            float3 exitHeading = default(float3))
+            float3 exitHeading = default(float3),
+            Entity initialFromEdge = default(Entity),
+            Entity finalToEdge = default(Entity))
         {
             if (startNode == Entity.Null || endNode == Entity.Null)
                 return null;
@@ -318,7 +338,7 @@ namespace AutoBusLines
 
             if (startNode == endNode && !requireNonEmpty)
             {
-                if (!hasExit || CanTurn(startNode, initialHeading, exitHeading))
+                if (!hasExit || CanTurn(startNode, initialFromEdge, initialHeading, finalToEdge, exitHeading))
                     return new List<DirectedRoadEdge>();
                 // otherwise fall through: we need an actual loop back to this node
             }
@@ -365,7 +385,7 @@ namespace AutoBusLines
             for (int i = 0; i < startEdges.Count; i++)
             {
                 var e = startEdges[i];
-                if (!CanTurn(startNode, initialHeading, e.TangentAtFrom))
+                if (!CanTurn(startNode, initialFromEdge, initialHeading, e.EdgeEntity, e.TangentAtFrom))
                     continue;
                 Relax(e, e.Length, -1);
             }
@@ -381,7 +401,7 @@ namespace AutoBusLines
                 states[id] = st;
 
                 var cur = st.Edge;
-                if (cur.ToNode == endNode && (!hasExit || CanTurn(endNode, cur.TangentAtTo, exitHeading)))
+                if (cur.ToNode == endNode && (!hasExit || CanTurn(endNode, cur.EdgeEntity, cur.TangentAtTo, finalToEdge, exitHeading)))
                 {
                     goal = id;
                     break;
@@ -397,7 +417,7 @@ namespace AutoBusLines
                 for (int i = 0; i < outs.Count; i++)
                 {
                     var next = outs[i];
-                    if (!CanTurn(cur.ToNode, cur.TangentAtTo, next.TangentAtFrom))
+                    if (!CanTurn(cur.ToNode, cur.EdgeEntity, cur.TangentAtTo, next.EdgeEntity, next.TangentAtFrom))
                         continue;
                     Relax(next, st.G + next.Length, id);
                 }
@@ -447,7 +467,7 @@ namespace AutoBusLines
                 var next = cycle[(i + 1) % n];
                 if (e.ToNode != next.FromNode)
                     return false;
-                if (!CanTurn(e.ToNode, e.TangentAtTo, next.TangentAtFrom))
+                if (!CanTurn(e.ToNode, e.EdgeEntity, e.TangentAtTo, next.EdgeEntity, next.TangentAtFrom))
                     return false;
             }
             return totalLength <= maxRouteLength;
@@ -1029,8 +1049,8 @@ namespace AutoBusLines
                         if (NodeDistance(ctx, lastA.ToNode, firstB.FromNode) > 2000f || NodeDistance(ctx, lastB.ToNode, firstA.FromNode) > 2000f)
                             continue;
 
-                        var cross1 = FindShortestRoadPath(lastA.ToNode, firstB.FromNode, lastA.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2000f, false, firstB.TangentAtFrom);
-                        var cross2 = FindShortestRoadPath(lastB.ToNode, firstA.FromNode, lastB.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2000f, false, firstA.TangentAtFrom);
+                        var cross1 = FindShortestRoadPath(lastA.ToNode, firstB.FromNode, lastA.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2000f, false, firstB.TangentAtFrom, lastA.EdgeEntity, firstB.EdgeEntity);
+                        var cross2 = FindShortestRoadPath(lastB.ToNode, firstA.FromNode, lastB.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2000f, false, firstA.TangentAtFrom, lastB.EdgeEntity, firstA.EdgeEntity);
                         if (cross1 == null || cross2 == null)
                             continue;
 
@@ -1112,8 +1132,8 @@ namespace AutoBusLines
                 var firstFwd = chainFwd[0];
 
                 // Turnarounds: at a dead end the bus turns in place; elsewhere it needs a real loop
-                var endTurn = FindShortestRoadPath(lastFwd.ToNode, firstRev.FromNode, lastFwd.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2500f, false, firstRev.TangentAtFrom);
-                var startTurn = FindShortestRoadPath(lastRev.ToNode, firstFwd.FromNode, lastRev.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2500f, false, firstFwd.TangentAtFrom);
+                var endTurn = FindShortestRoadPath(lastFwd.ToNode, firstRev.FromNode, lastFwd.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2500f, false, firstRev.TangentAtFrom, lastFwd.EdgeEntity, firstRev.EdgeEntity);
+                var startTurn = FindShortestRoadPath(lastRev.ToNode, firstFwd.FromNode, lastRev.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, 2500f, false, firstFwd.TangentAtFrom, lastRev.EdgeEntity, firstFwd.EdgeEntity);
                 if (endTurn == null || startTurn == null)
                     continue;
 
@@ -1165,6 +1185,7 @@ namespace AutoBusLines
                 float length = seedD.Length;
                 Entity currNode = seedD.ToNode;
                 float3 currHeading = seedD.TangentAtTo;
+                var currEdge = seedD;
 
                 for (int step = 0; step < maxChain - 1; step++)
                 {
@@ -1207,7 +1228,7 @@ namespace AutoBusLines
                         if (length + cands[k].Bound + cd.Length + homeLb > ctx.MaxRouteLength)
                             continue;
 
-                        var path = FindShortestRoadPath(currNode, cd.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, 4000f, false, cd.TangentAtFrom);
+                        var path = FindShortestRoadPath(currNode, cd.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, 4000f, false, cd.TangentAtFrom, currEdge.EdgeEntity, cd.EdgeEntity);
                         if (path == null)
                             continue;
 
@@ -1233,6 +1254,7 @@ namespace AutoBusLines
                     var lastEdge = leg[leg.Count - 1];
                     currNode = lastEdge.ToNode;
                     currHeading = lastEdge.TangentAtTo;
+                    currEdge = lastEdge;
                 }
 
                 // Close the loop back to the seed. If that is impossible or too long, drop the last stop and retry.
@@ -1240,7 +1262,7 @@ namespace AutoBusLines
                 List<DirectedRoadEdge> acceptedCycle = null;
                 while (true)
                 {
-                    var returnPath = FindShortestRoadPath(currNode, seedD.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, closingLimit, false, seedD.TangentAtFrom);
+                    var returnPath = FindShortestRoadPath(currNode, seedD.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, closingLimit, false, seedD.TangentAtFrom, currEdge.EdgeEntity, seedD.EdgeEntity);
                     if (returnPath != null)
                     {
                         var cycle = new List<DirectedRoadEdge>();
@@ -1265,6 +1287,7 @@ namespace AutoBusLines
                     var prevLeg = legs[legs.Count - 1];
                     currNode = prevLeg[prevLeg.Count - 1].ToNode;
                     currHeading = prevLeg[prevLeg.Count - 1].TangentAtTo;
+                    currEdge = prevLeg[prevLeg.Count - 1];
                 }
 
                 if (acceptedCycle == null)
@@ -1354,7 +1377,7 @@ namespace AutoBusLines
 
                 var seedD = ctx.StopEdge[s];
                 float maxReturn = math.clamp(ctx.MaxRouteLength * 0.6f, 5000f, 8000f);
-                var returnPath = FindShortestRoadPath(seedD.ToNode, seedD.FromNode, seedD.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, maxReturn, false, seedD.TangentAtFrom);
+                var returnPath = FindShortestRoadPath(seedD.ToNode, seedD.FromNode, seedD.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, maxReturn, false, seedD.TangentAtFrom, seedD.EdgeEntity, seedD.EdgeEntity);
                 if (returnPath == null || returnPath.Count == 0)
                     continue;
 
@@ -1568,6 +1591,7 @@ namespace AutoBusLines
                     float length = seedD.Length;
                     Entity currNode = seedD.ToNode;
                     float3 currHeading = seedD.TangentAtTo;
+                    var currEdge = seedD;
 
                     int maxChain = math.min(cluster.Count, ctx.MaxStops);
 
@@ -1601,7 +1625,7 @@ namespace AutoBusLines
                             if (length + lb + cd.Length + homeLb > ctx.MaxRouteLength)
                                 continue;
 
-                            var path = FindShortestRoadPath(currNode, cd.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, 4000f, false, cd.TangentAtFrom);
+                            var path = FindShortestRoadPath(currNode, cd.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, 4000f, false, cd.TangentAtFrom, currEdge.EdgeEntity, cd.EdgeEntity);
                             if (path == null)
                                 continue;
 
@@ -1627,6 +1651,7 @@ namespace AutoBusLines
                         var lastEdge = leg[leg.Count - 1];
                         currNode = lastEdge.ToNode;
                         currHeading = lastEdge.TangentAtTo;
+                        currEdge = lastEdge;
                     }
 
                     // Close the loop back to seed
@@ -1634,7 +1659,7 @@ namespace AutoBusLines
                     List<DirectedRoadEdge> acceptedCycle = null;
                     while (true)
                     {
-                        var returnPath = FindShortestRoadPath(currNode, seedD.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, closingLimit, false, seedD.TangentAtFrom);
+                        var returnPath = FindShortestRoadPath(currNode, seedD.FromNode, currHeading, ctx.NodeOutEdges, ctx.NodePositions, closingLimit, false, seedD.TangentAtFrom, currEdge.EdgeEntity, seedD.EdgeEntity);
                         if (returnPath != null)
                         {
                             var cycle = new List<DirectedRoadEdge>();
@@ -1659,6 +1684,7 @@ namespace AutoBusLines
                         var prevLeg = legs[legs.Count - 1];
                         currNode = prevLeg[prevLeg.Count - 1].ToNode;
                         currHeading = prevLeg[prevLeg.Count - 1].TangentAtTo;
+                        currEdge = prevLeg[prevLeg.Count - 1];
                     }
 
                     if (acceptedCycle != null)
@@ -1692,7 +1718,7 @@ namespace AutoBusLines
                 return true;
             }
 
-            var path = FindShortestRoadPath(ea.ToNode, eb.FromNode, ea.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, maxSearch, false, eb.TangentAtFrom);
+            var path = FindShortestRoadPath(ea.ToNode, eb.FromNode, ea.TangentAtTo, ctx.NodeOutEdges, ctx.NodePositions, maxSearch, false, eb.TangentAtFrom, ea.EdgeEntity, eb.EdgeEntity);
             if (path == null)
                 return false;
 

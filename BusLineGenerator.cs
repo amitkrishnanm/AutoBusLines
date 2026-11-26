@@ -1,4 +1,4 @@
-// AutoBusLines v2.1.0-hotfix - Modular transit planning and generation system
+// AutoBusLines v2.1.1 - Modular transit planning and generation system
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -278,6 +278,7 @@ namespace AutoBusLines
         private List<Entity> _createdRouteEntities = new List<Entity>();
         private int _settlingWaitCounter = 0;
         private int _settlingPass = 0;
+        private int _settlingPendingWaitPasses = 0;
         private Entity _cachedBusLinePrefabEntity = Entity.Null;
         private RouteData _cachedBusLineRouteData;
         private int _totalStopsPlaced = 0;
@@ -517,6 +518,7 @@ namespace AutoBusLines
             _createdRouteEntities.Clear();
             _settlingWaitCounter = 0;
             _settlingPass = 0;
+            _settlingPendingWaitPasses = 0;
             _pendingVirtualStops.Clear();
             _virtualToRealEntityMap.Clear();
             _currentVirtualStopIndex = 0;
@@ -543,6 +545,7 @@ namespace AutoBusLines
             _createdRouteEntities.Clear();
             _settlingWaitCounter = 0;
             _settlingPass = 0;
+            _settlingPendingWaitPasses = 0;
             _depotFinder?.Reset();
             _roadScanner?.Reset();
             _roadAssigner?.Reset();
@@ -819,6 +822,7 @@ namespace AutoBusLines
                 _generationStage = GenerationStage.SettlingRoutes;
                 _settlingWaitCounter = 0;
                 _settlingPass = 0;
+                _settlingPendingWaitPasses = 0;
                 AutoBusLinesUISystem.Instance?.SetBuildProgress(0.95f, "building", "Verifying route pathfinding and road connections...");
                 log.Info($"Stage 3 Complete: {_createdLineCount} bus lines created. Transitioning to Stage 4 (Settling & Path Verification) for {_createdRouteEntities.Count} routes...");
                 return;
@@ -828,15 +832,16 @@ namespace AutoBusLines
             if (_generationStage == GenerationStage.SettlingRoutes)
             {
                 _settlingWaitCounter++;
-                if (_settlingWaitCounter < 25)
+                if (_settlingWaitCounter < 15)
                 {
-                    return; // Wait 25 frames between verification passes to allow background pathfinding threads to complete
+                    return; // Wait 15 frames between verification polls while worker pathfinding drains
                 }
 
                 _settlingWaitCounter = 0;
-                _settlingPass++;
 
-                int totalBrokenSegments = 0;
+                int pendingSegments = 0;
+                int confirmedBrokenSegments = 0;
+                var pendingSegmentResetTargets = new List<(Entity Route, Entity Segment)>();
                 var brokenSegmentsToReset = new HashSet<Entity>();
                 var routesWithBrokenSegments = new HashSet<Entity>();
                 var stopsToNudge = new HashSet<Entity>();
@@ -857,116 +862,122 @@ namespace AutoBusLines
                     if (segBuf.Length == 0 || wpBuf.Length == 0)
                         continue;
 
-                    bool routeHasBroken = false;
                     for (int s = 0; s < segBuf.Length; s++)
                     {
                         var segEnt = segBuf[s].m_Segment;
                         if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
                         {
-                            routeHasBroken = true;
-                            totalBrokenSegments++;
+                            confirmedBrokenSegments++;
+                            routesWithBrokenSegments.Add(routeEnt);
                             continue;
                         }
 
-                        bool isBroken = false;
-                        if (EntityManager.HasComponent<PathInformation>(segEnt))
+                        if (IsSegmentPathPending(segEnt))
                         {
-                            var pi = EntityManager.GetComponentData<PathInformation>(segEnt);
-                            if (pi.m_Distance <= 0f)
-                            {
-                                isBroken = true;
-                            }
-                        }
-                        else
-                        {
-                            isBroken = true;
+                            pendingSegments++;
+                            pendingSegmentResetTargets.Add((routeEnt, segEnt));
+                            continue;
                         }
 
-                        if (!EntityManager.HasBuffer<PathElement>(segEnt) || EntityManager.GetBuffer<PathElement>(segEnt).Length == 0)
+                        if (IsSegmentBrokenCompleted(segEnt))
                         {
-                            isBroken = true;
+                            confirmedBrokenSegments++;
                         }
+                    }
+                }
 
-                        if (isBroken)
+                const int MaxPendingWaitPasses = 30; // up to ~450 frames for all worker pathfinds to settle
+                if (pendingSegments > 0 && _settlingPendingWaitPasses < MaxPendingWaitPasses)
+                {
+                    _settlingPendingWaitPasses++;
+                    if (_settlingPendingWaitPasses == 1 || _settlingPendingWaitPasses % 5 == 0)
+                    {
+                        int globalPending = World.GetExistingSystemManaged<PathfindResultSystem>()?.pendingRequestCount ?? -1;
+                        log.Info($"SettlingRoutes waiting: {pendingSegments} route segments pending (PathfindResultSystem.pending={globalPending}, confirmedBroken={confirmedBrokenSegments}, wait={_settlingPendingWaitPasses}/{MaxPendingWaitPasses}).");
+                    }
+
+                    AutoBusLinesUISystem.Instance?.SetBuildProgress(0.95f + 0.01f * math.min(3, _settlingPass), "building",
+                        $"Waiting for pathfinding ({pendingSegments} segments pending)...");
+                    return;
+                }
+
+                bool pendingTimedOut = pendingSegments > 0;
+                if (pendingTimedOut)
+                {
+                    log.Warn($"SettlingRoutes: {pendingSegments} segments remained pending after {_settlingPendingWaitPasses * 15} frames; treating them as stalled for retry pass {_settlingPass + 1}.");
+                }
+
+                _settlingPendingWaitPasses = 0;
+                _settlingPass++;
+                bool allowNudge = _settlingPass >= 2;
+
+                // Collect exact broken segments and only mark/nudge waypoints (and adjacent segments) that actually need fixing.
+                for (int r = 0; r < _createdRouteEntities.Count; r++)
+                {
+                    var routeEnt = _createdRouteEntities[r];
+                    if (!EntityManager.Exists(routeEnt) || EntityManager.HasComponent<Deleted>(routeEnt))
+                        continue;
+
+                    if (!EntityManager.HasBuffer<RouteSegment>(routeEnt) || !EntityManager.HasBuffer<RouteWaypoint>(routeEnt))
+                        continue;
+
+                    var segBuf = EntityManager.GetBuffer<RouteSegment>(routeEnt);
+                    var wpBuf = EntityManager.GetBuffer<RouteWaypoint>(routeEnt);
+
+                    if (segBuf.Length == 0 || wpBuf.Length == 0)
+                        continue;
+
+                    for (int s = 0; s < segBuf.Length; s++)
+                    {
+                        var segEnt = segBuf[s].m_Segment;
+                        if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
+                            continue;
+
+                        if (IsSegmentPathPending(segEnt) || !IsSegmentBrokenCompleted(segEnt))
+                            continue;
+
+                        routesWithBrokenSegments.Add(routeEnt);
+                        brokenSegmentsToReset.Add(segEnt);
+
+                        int wpIndexA = s;
+                        int wpIndexB = (s + 1) % wpBuf.Length;
+                        bool refreshA = wpIndexA < wpBuf.Length &&
+                            ProcessBrokenEndpointWaypoint(wpBuf[wpIndexA].m_Waypoint, allowNudge, stopsToNudge, curbsideWaypointsToNudge);
+                        bool refreshB = wpIndexB < wpBuf.Length &&
+                            ProcessBrokenEndpointWaypoint(wpBuf[wpIndexB].m_Waypoint, allowNudge, stopsToNudge, curbsideWaypointsToNudge);
+
+                        if (refreshA)
                         {
-                            routeHasBroken = true;
-                            totalBrokenSegments++;
-                            brokenSegmentsToReset.Add(segEnt);
-
-                            // The failed segment connects Waypoint s to Waypoint (s + 1) % wpBuf.Length
-                            int wpIndexA = s;
-                            int wpIndexB = (s + 1) % wpBuf.Length;
-
-                            if (wpIndexA < wpBuf.Length)
-                            {
-                                var wpA = wpBuf[wpIndexA].m_Waypoint;
-                                if (EntityManager.Exists(wpA) && !EntityManager.HasComponent<Deleted>(wpA))
-                                {
-                                    if (!EntityManager.HasComponent<Updated>(wpA))
-                                        EntityManager.AddComponentData(wpA, default(Updated));
-
-                                    if (EntityManager.HasComponent<Connected>(wpA))
-                                    {
-                                        var stopA = EntityManager.GetComponentData<Connected>(wpA).m_Connected;
-                                        if (stopA != Entity.Null && EntityManager.Exists(stopA) && !EntityManager.HasComponent<Deleted>(stopA) &&
-                                            ShouldNudgeStopForWaypoint(wpA, stopA))
-                                        {
-                                            stopsToNudge.Add(stopA);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        curbsideWaypointsToNudge.Add(wpA);
-                                    }
-                                }
-                            }
-
-                            if (wpIndexB < wpBuf.Length)
-                            {
-                                var wpB = wpBuf[wpIndexB].m_Waypoint;
-                                if (EntityManager.Exists(wpB) && !EntityManager.HasComponent<Deleted>(wpB))
-                                {
-                                    if (!EntityManager.HasComponent<Updated>(wpB))
-                                        EntityManager.AddComponentData(wpB, default(Updated));
-
-                                    if (EntityManager.HasComponent<Connected>(wpB))
-                                    {
-                                        var stopB = EntityManager.GetComponentData<Connected>(wpB).m_Connected;
-                                        if (stopB != Entity.Null && EntityManager.Exists(stopB) && !EntityManager.HasComponent<Deleted>(stopB) &&
-                                            ShouldNudgeStopForWaypoint(wpB, stopB))
-                                        {
-                                            stopsToNudge.Add(stopB);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        curbsideWaypointsToNudge.Add(wpB);
-                                    }
-                                }
-                            }
-
-                            // Also reset adjacent segments touching these two waypoints
                             int prevSegIdx = (s - 1 + segBuf.Length) % segBuf.Length;
-                            int nextSegIdx = (s + 1) % segBuf.Length;
                             if (prevSegIdx < segBuf.Length)
                                 brokenSegmentsToReset.Add(segBuf[prevSegIdx].m_Segment);
+                        }
+                        if (refreshB)
+                        {
+                            int nextSegIdx = (s + 1) % segBuf.Length;
                             if (nextSegIdx < segBuf.Length)
                                 brokenSegmentsToReset.Add(segBuf[nextSegIdx].m_Segment);
                         }
                     }
+                }
 
-                    if (routeHasBroken)
+                if (pendingTimedOut)
+                {
+                    for (int i = 0; i < pendingSegmentResetTargets.Count; i++)
                     {
-                        routesWithBrokenSegments.Add(routeEnt);
+                        routesWithBrokenSegments.Add(pendingSegmentResetTargets[i].Route);
+                        brokenSegmentsToReset.Add(pendingSegmentResetTargets[i].Segment);
                     }
                 }
 
+                int totalBrokenSegments = confirmedBrokenSegments + pendingSegments;
+
                 if (totalBrokenSegments > 0 && _settlingPass <= 3)
                 {
-                    log.Info($"SettlingRoutes Pass {_settlingPass}: Found {totalBrokenSegments} incomplete/broken segments across {routesWithBrokenSegments.Count} routes. Re-enqueuing...");
+                    log.Info($"SettlingRoutes Pass {_settlingPass}: Found {confirmedBrokenSegments} broken + {pendingSegments} stalled segments across {routesWithBrokenSegments.Count} routes (nudging {stopsToNudge.Count} stops, {curbsideWaypointsToNudge.Count} curbside waypoints). Re-enqueuing {brokenSegmentsToReset.Count} segments...");
 
                     // If pass >= 2 and physical roadside stops failed, nudge only improperly bound stops and batch road updates
-                    if (_settlingPass >= 2)
+                    if (allowNudge)
                     {
                         var nudgedRoads = new HashSet<Entity>();
                         foreach (var stopEntity in stopsToNudge)
@@ -983,42 +994,11 @@ namespace AutoBusLines
                         }
                     }
 
-                    // Reset PathTargets and PathInformation on affected segments
-                    foreach (var segEnt in brokenSegmentsToReset)
-                    {
-                        if (!EntityManager.Exists(segEnt) || EntityManager.HasComponent<Deleted>(segEnt))
-                            continue;
-
-                        if (EntityManager.HasComponent<PathTargets>(segEnt))
-                            EntityManager.SetComponentData(segEnt, new PathTargets());
-
-                        if (EntityManager.HasComponent<PathInformation>(segEnt))
-                            EntityManager.SetComponentData(segEnt, default(PathInformation));
-
-                        if (EntityManager.HasBuffer<PathElement>(segEnt))
-                            EntityManager.GetBuffer<PathElement>(segEnt).Clear();
-
-                        if (EntityManager.HasBuffer<CurveElement>(segEnt))
-                            EntityManager.GetBuffer<CurveElement>(segEnt).Clear();
-
-                        if (!EntityManager.HasComponent<Updated>(segEnt))
-                            EntityManager.AddComponentData(segEnt, default(Updated));
-                    }
-
-                    foreach (var rEnt in routesWithBrokenSegments)
-                    {
-                        if (!EntityManager.Exists(rEnt) || EntityManager.HasComponent<Deleted>(rEnt))
-                            continue;
-
-                        if (!EntityManager.HasComponent<Updated>(rEnt))
-                            EntityManager.AddComponentData(rEnt, default(Updated));
-                        if (!EntityManager.HasComponent<BatchesUpdated>(rEnt))
-                            EntityManager.AddComponentData(rEnt, default(BatchesUpdated));
-                    }
+                    ResetRouteSegmentsForPathfinding(brokenSegmentsToReset, routesWithBrokenSegments);
 
                     float settleProgress = 0.95f + 0.01f * _settlingPass;
                     AutoBusLinesUISystem.Instance?.SetBuildProgress(settleProgress, "building", $"Resolving route pathfinding (pass {_settlingPass}/3, {totalBrokenSegments} segments remaining)...");
-                    return; // Wait next 25 frames
+                    return; // Wait for re-enqueued pathfinds to settle before the next pass
                 }
 
                 if (totalBrokenSegments > 0)
